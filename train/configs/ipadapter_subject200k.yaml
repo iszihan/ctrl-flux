@@ -4,6 +4,7 @@ dtype: "bf16"
 resume_from_checkpoint: false
 cache_latents: false
 gradient_checkpointing: true
+expname: "debug"
 
 dataset:
   type: "subject"
@@ -55,5 +56,5 @@ logging:
   logger: "wandb"
   checkpointing_steps: 1000
   checkpoints_total_limit: 10
-  test_steps: 100
+  test_steps: 200
   validation_epochs: 1

@@ -2,6 +2,8 @@ import os
 import torch 
 from omegaconf import OmegaConf 
 import math
+from typing import Optional, Union                                                                     
+import safetensors.torch
 import copy
 from tqdm import tqdm
 from pathlib import Path
@@ -9,6 +11,7 @@ from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration
 
+from diffusers.models.transformers.transformer_flux import FluxIPAdapterAttnProcessor              
 from diffusers.optimization import get_scheduler
 from diffusers.pipelines import FluxPipeline
 from diffusers.training_utils import compute_density_for_timestep_sampling, compute_loss_weighting_for_sd3
@@ -275,6 +278,227 @@ def encode_prompt(
 
     return prompt_embeds, pooled_prompt_embeds, text_ids
 
+
+def save_ip_adapter(                                                                                   
+      pipeline,                
+      accelerator,                                                                                
+      save_directory: Union[str, os.PathLike],                                                           
+      weight_name: str = "ip_adapter.safetensors",                                                       
+      safe_serialization: bool = True,                                                                   
+      adapter_index: int = 0,                                                                            
+  ):                                                                                                     
+      """                                                                                                
+      Save IP-Adapter weights in the format expected by load_ip_adapter() for Flux.                      
+                                                                                                         
+      Args:                                                                                              
+          pipeline: FluxPipeline with IP-Adapter loaded                                                  
+          save_directory: Directory to save the weights                                                  
+          weight_name: Filename for the saved weights                                                    
+          safe_serialization: Whether to use safetensors (True) or torch.save (False)                    
+          adapter_index: Which IP adapter to save if multiple are loaded (default: 0)                    
+      """                                                                                                
+                                                                                                         
+      transformer = pipeline.transformer                                                                 
+                                                                                                         
+      # Unwrap accelerate-wrapped model                                                                  
+      transformer = accelerator.unwrap_model(transformer)                                                            
+                                                                                                         
+      # Check if IP adapter is loaded                                                                    
+      if transformer.encoder_hid_proj is None:                                                           
+          raise ValueError("No IP-Adapter loaded in the pipeline.")                                      
+                                                                                                         
+      state_dict = {                                                                                     
+          "image_proj": {},                                                                              
+          "ip_adapter": {},                                                                              
+      }                                                                                                  
+                                                                                                         
+      # ========== Extract image_proj weights ==========                                                 
+      # encoder_hid_proj is MultiIPAdapterImageProjection with image_projection_layers                   
+      image_proj_layer = transformer.encoder_hid_proj.image_projection_layers[adapter_index]             
+                                                                                                         
+      # ImageProjection has: image_embeds (nn.Linear), norm (nn.LayerNorm)                               
+      # Need to convert image_embeds -> proj for the expected format                                     
+      image_proj_state = image_proj_layer.state_dict()                                                   
+                                                                                                         
+      for key, value in image_proj_state.items():                                                        
+          # Convert "image_embeds.weight" -> "proj.weight", etc.                                         
+          new_key = key.replace("image_embeds", "proj")                                                  
+          state_dict["image_proj"][new_key] = value                                                      
+                                                                                                         
+      # ========== Extract ip_adapter weights ==========                                                 
+      # Iterate through attention processors and extract IP adapter weights                              
+      key_id = 0                                                                                         
+      for name, attn_processor in transformer.attn_processors.items():                                   
+          # Skip single_transformer_blocks - they don't have IP adapter                                  
+          if name.startswith("single_transformer_blocks"):                                               
+              continue                                                                                   
+                                                                                                         
+          if not isinstance(attn_processor, FluxIPAdapterAttnProcessor):                                 
+              raise ValueError(                                                                          
+                  f"Expected FluxIPAdapterAttnProcessor for {name}, "                                    
+                  f"got {type(attn_processor).__name__}"                                                 
+              )                                                                                          
+                                                                                                         
+          # Extract to_k_ip and to_v_ip for the specified adapter_index                                  
+          # to_k_ip and to_v_ip are nn.ModuleList                                                        
+          to_k_ip = attn_processor.to_k_ip[adapter_index]                                                
+          to_v_ip = attn_processor.to_v_ip[adapter_index]                                                
+                                                                                                         
+          state_dict["ip_adapter"][f"{key_id}.to_k_ip.weight"] = to_k_ip.weight.data.clone()             
+          state_dict["ip_adapter"][f"{key_id}.to_k_ip.bias"] = to_k_ip.bias.data.clone()                 
+          state_dict["ip_adapter"][f"{key_id}.to_v_ip.weight"] = to_v_ip.weight.data.clone()             
+          state_dict["ip_adapter"][f"{key_id}.to_v_ip.bias"] = to_v_ip.bias.data.clone()                 
+                                                                                                         
+          key_id += 1                                                                                    
+                                                                                                         
+      # ========== Save to disk ==========                                                               
+      os.makedirs(save_directory, exist_ok=True)                                                         
+      save_path = os.path.join(save_directory, weight_name)                                              
+                                                                                                         
+      if safe_serialization:                                                                             
+          # Flatten the nested dict for safetensors                                                      
+          flat_state_dict = {}                                                                           
+          for prefix, sub_dict in state_dict.items():                                                    
+              for key, value in sub_dict.items():                                                        
+                  flat_state_dict[f"{prefix}.{key}"] = value                                             
+                                                                                                         
+          safetensors.torch.save_file(flat_state_dict, save_path)                                        
+      else:                                                                                              
+          torch.save(state_dict, save_path)                                                              
+                                                                                                         
+      print(f"IP-Adapter saved to {save_path}")                                                          
+      return save_path 
+  
+def create_ip_adapter_hooks(accelerator, transformer):                                                 
+      """                                                                                                
+      Create save/load hooks for IP adapter training with accelerate.                                    
+                                                                                                         
+      Args:                                                                                              
+          accelerator: The accelerate Accelerator instance                                               
+          transformer: The FluxTransformer2DModel (can be accelerate-wrapped)                            
+                                                                                                         
+      Returns:                                                                                           
+          Tuple of (save_model_hook, load_model_hook)                                                    
+      """                                                                                                
+                                                                                                         
+      def save_model_hook(models, weights, output_dir):                                                  
+          if accelerator.is_main_process:                                                                
+              for model in models:                                                                       
+                  unwrapped = accelerator.unwrap_model(model)                                                        
+                                                                                                         
+                  # Check if this is the transformer with IP adapter                                     
+                  if isinstance(unwrapped, type(accelerator.unwrap_model(transformer))):                             
+                      state_dict = {                                                                     
+                          "image_proj": {},                                                              
+                          "ip_adapter": {},                                                              
+                      }                                                                                  
+                                                                                                         
+                      # ========== Extract image_proj weights ==========                                 
+                      if unwrapped.encoder_hid_proj is None:                                             
+                          raise ValueError("No IP-Adapter loaded in the transformer.")                   
+                                                                                                         
+                      # Support single IP adapter (index 0)                                              
+                      image_proj_layer = unwrapped.encoder_hid_proj.image_projection_layers[0]           
+                      image_proj_state = image_proj_layer.state_dict()                                   
+                                                                                                         
+                      for key, value in image_proj_state.items():                                        
+                          # Convert "image_embeds.weight" -> "proj.weight"                               
+                          new_key = key.replace("image_embeds", "proj")                                  
+                          state_dict["image_proj"][new_key] = value.cpu()                                
+                                                                                                         
+                      # ========== Extract ip_adapter weights ==========                                 
+                      key_id = 0                                                                         
+                      for name, attn_processor in unwrapped.attn_processors.items():                     
+                          # Skip single_transformer_blocks - they don't have IP adapter                  
+                          if name.startswith("single_transformer_blocks"):                               
+                              continue                                                                   
+                                                                                                         
+                          if not isinstance(attn_processor, FluxIPAdapterAttnProcessor):                 
+                              raise ValueError(                                                          
+                                  f"Expected FluxIPAdapterAttnProcessor for {name}, "                    
+                                  f"got {type(attn_processor).__name__}"                                 
+                              )                                                                          
+                                                                                                         
+                          # Extract to_k_ip and to_v_ip for adapter index 0                              
+                          to_k_ip = attn_processor.to_k_ip[0]                                            
+                          to_v_ip = attn_processor.to_v_ip[0]                                            
+                                                                                                         
+                          state_dict["ip_adapter"][f"{key_id}.to_k_ip.weight"] = to_k_ip.weight.data.cpu().clone()                                                                      
+                          state_dict["ip_adapter"][f"{key_id}.to_k_ip.bias"] = to_k_ip.bias.data.cpu().clone()                                                                      
+                          state_dict["ip_adapter"][f"{key_id}.to_v_ip.weight"] = to_v_ip.weight.data.cpu().clone()                                                                      
+                          state_dict["ip_adapter"][f"{key_id}.to_v_ip.bias"] = to_v_ip.bias.data.cpu().clone()                                                                        
+                                                                                                         
+                          key_id += 1                                                                    
+                                                                                                         
+                      # ========== Save to disk ==========                                               
+                      # Flatten for safetensors format                                                   
+                      flat_state_dict = {}                                                               
+                      for prefix, sub_dict in state_dict.items():                                        
+                          for key, value in sub_dict.items():                                            
+                              flat_state_dict[f"{prefix}.{key}"] = value                                 
+
+                      safetensors.torch.save_file(flat_state_dict, f"{output_dir}/ip_adapter.safetensors")                            
+                                                                                                         
+                  # Pop weight so accelerate doesn't save in its default format                          
+                  weights.pop()                                                                          
+                                                                                                         
+      def load_model_hook(models, input_dir):                                                            
+          while len(models) > 0:                                                                         
+              model = models.pop()                                                                       
+              unwrapped = unwrap_model(model)                                                            
+                                                                                                         
+              # Check if this is the transformer with IP adapter                                         
+              if isinstance(unwrapped, type(unwrap_model(transformer))):                                 
+                  load_path = os.path.join(input_dir, "ip_adapter.safetensors")                          
+                                                                                                         
+                  if not os.path.exists(load_path):                                                      
+                      raise ValueError(f"IP adapter checkpoint not found at {load_path}")                
+                                                                                                         
+                  # Load the flat state dict                                                             
+                  with safetensors.torch.safe_open(load_path, framework="pt", device="cpu") as f:        
+                      state_dict = {"image_proj": {}, "ip_adapter": {}}                                  
+                                                                                                         
+                      for key in f.keys():                                                               
+                          if key.startswith("image_proj."):                                              
+                              new_key = key.replace("image_proj.", "")                                   
+                              state_dict["image_proj"][new_key] = f.get_tensor(key)                      
+                          elif key.startswith("ip_adapter."):                                            
+                              new_key = key.replace("ip_adapter.", "")                                   
+                              state_dict["ip_adapter"][new_key] = f.get_tensor(key)                      
+                                                                                                         
+                  # ========== Load image_proj weights ==========                                        
+                  image_proj_layer = unwrapped.encoder_hid_proj.image_projection_layers[0]               
+                                                                                                         
+                  # Convert "proj.weight" -> "image_embeds.weight"                                       
+                  converted_image_proj_state = {}                                                        
+                  for key, value in state_dict["image_proj"].items():                                    
+                      new_key = key.replace("proj", "image_embeds")                                      
+                      converted_image_proj_state[new_key] = value                                        
+                                                                                                         
+                  image_proj_layer.load_state_dict(converted_image_proj_state)                           
+                                                                                                         
+                  # ========== Load ip_adapter weights ==========                                        
+                  key_id = 0                                                                             
+                  for name, attn_processor in unwrapped.attn_processors.items():                         
+                      if name.startswith("single_transformer_blocks"):                                   
+                          continue                                                                       
+                                                                                                         
+                      if not isinstance(attn_processor, FluxIPAdapterAttnProcessor):                     
+                          continue                                                                       
+                                                                                                         
+                      to_k_ip = attn_processor.to_k_ip[0]                                                
+                      to_v_ip = attn_processor.to_v_ip[0]                                                
+                                                                                                         
+                      to_k_ip.weight.data.copy_(state_dict["ip_adapter"][f"{key_id}.to_k_ip.weight"])    
+                      to_k_ip.bias.data.copy_(state_dict["ip_adapter"][f"{key_id}.to_k_ip.bias"])        
+                      to_v_ip.weight.data.copy_(state_dict["ip_adapter"][f"{key_id}.to_v_ip.weight"])    
+                      to_v_ip.bias.data.copy_(state_dict["ip_adapter"][f"{key_id}.to_v_ip.bias"])        
+                                                                                                         
+                      key_id += 1                                                                        
+                                                                                                         
+      return save_model_hook, load_model_hook                                                            
+                                                           
+  
 def log_test_sample(pipeline, 
                     test_sample, 
                     accelerator, 
@@ -335,6 +559,9 @@ def main():
     config = OmegaConf.load(config_path)
     
     # Initialize the accelerator
+    config.logging.output_dir = Path(config.logging.output_dir, config.expname)
+    if not os.path.exists(config.logging.output_dir):
+        os.makedirs(config.logging.output_dir, exist_ok=True)
     logging_dir = Path(config.logging.output_dir, config.logging.logging_dir)
     accelerator = Accelerator(
         mixed_precision=config.dtype,
@@ -472,6 +699,10 @@ def main():
         num_cycles=config.train.scheduler.num_cycles,
         power=config.train.scheduler.power,
     )
+    
+    save_model_hook, load_model_hook = create_ip_adapter_hooks(accelerator, flux_pipeline.transformer)
+    accelerator.register_save_state_pre_hook(save_model_hook)
+    accelerator.register_load_state_pre_hook(load_model_hook)
     
     transformer, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         flux_pipeline.transformer, optimizer, train_dataloader, lr_scheduler
@@ -651,8 +882,8 @@ def main():
                     if global_step % config.logging.checkpointing_steps == 0:
                         if config.logging.checkpoints_total_limit > 0:
                             checkpoints = os.listdir(config.logging.output_dir)
-                            checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
-                            checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
+                            checkpoints = [d for d in checkpoints if d.endswith("safetensors")]
+                            checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1].split(".")[0]))
                             
                             # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
                             if len(checkpoints) >= config.logging.checkpoints_total_limit:
@@ -667,9 +898,16 @@ def main():
                                 for removing_checkpoint in removing_checkpoints:
                                     removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
                                     shutil.rmtree(removing_checkpoint)
-                        save_path = os.path.join(config.logging.output_dir, f"checkpoint-{global_step}")
-                        accelerator.save_state(save_path)
-                        logger.info(f"Saved state to {save_path}")
+                        # save_ip_adapter(pipeline=flux_pipeline,
+                        #                 accelerator=accelerator,
+                        #                 save_directory=config.logging.output_dir,
+                        #                 weight_name=f"ip_adapter-{global_step:06d}.safetensors",
+                        #                 safe_serialization=True,
+                        #                 adapter_index=0)
+                        accelerator.save_state(f"{config.logging.output_dir}/ip_adapter-{global_step:06d}", safe_serialization=True)
+                        logger.info(f"Saved state to {config.logging.output_dir}/ip_adapter-{global_step:06d}.safetensors")
+                        exit()
+                        
             
             logs = {"loss": loss.detach().item(), 
                     "lr": lr_scheduler.get_last_lr()[0]}
@@ -677,30 +915,40 @@ def main():
             accelerator.log(logs, step=global_step)
             if global_step >= config.train.max_train_steps:
                 break 
-            if step % config.logging.test_steps == 0:
+            
+            # Generate test samples every N steps
+            if step % config.logging.test_steps == 0 and accelerator.is_main_process:
                 transformer.eval()
                 test_sample = next(test_iter)
-                log_test_sample(pipeline=flux_pipeline, 
-                                test_sample=test_sample, 
-                                accelerator=accelerator, 
-                                weight_dtype=weight_dtype, 
-                                config=config, 
+                # Temporarily unwrap the transformer for inference
+                # DDP wrapping breaks pipeline access to transformer.config
+                flux_pipeline.transformer = accelerator.unwrap_model(transformer)
+                log_test_sample(pipeline=flux_pipeline,
+                                test_sample=test_sample,
+                                accelerator=accelerator,
+                                weight_dtype=weight_dtype,
+                                config=config,
                                 is_final_validation=False)
+                # Restore the wrapped transformer for training
+                flux_pipeline.transformer = transformer
                 transformer.train()
                 
-                
-        
-        # After one epoch, generate test examples for validation  
+        # After one epoch, generate test examples for validation
         if accelerator.is_main_process:
             if epoch % config.logging.test_steps == 0:
                 transformer.eval()
-                test_smaple = next(iter(test_dataloader))
-                log_test_sample(pipeline=flux_pipeline, 
-                                test_sample=test_sample, 
-                                accelerator=accelerator, 
-                                weight_dtype=weight_dtype, 
-                                config=config, 
+                test_sample = next(iter(test_dataloader))
+                # Temporarily unwrap the transformer for inference
+                flux_pipeline.transformer = accelerator.unwrap_model(transformer)
+                log_test_sample(pipeline=flux_pipeline,
+                                test_sample=test_sample,
+                                accelerator=accelerator,
+                                weight_dtype=weight_dtype,
+                                config=config,
                                 is_final_validation=False)
+                # Restore the wrapped transformer for training
+                flux_pipeline.transformer = transformer
+                transformer.train()
                 
                 
                 
