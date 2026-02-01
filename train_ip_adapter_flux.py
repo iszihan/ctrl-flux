@@ -11,7 +11,7 @@ from accelerate.utils import ProjectConfiguration
 
 from diffusers.optimization import get_scheduler
 from diffusers.pipelines import FluxPipeline
-from diffusers.training_utils import compute_density_for_timestep_sampling
+from diffusers.training_utils import compute_density_for_timestep_sampling, compute_loss_weighting_for_sd3
 from transformers import CLIPVisionModelWithProjection, CLIPImageProcessor
 from datasets import load_dataset
 from ipadapters.ipadapter import setup_ip_adapter
@@ -20,6 +20,7 @@ import torchvision.transforms as T
 import random
 import numpy as np
 from PIL import Image
+import wandb
 
 DTYPE_MAP = {
     "bf16": torch.bfloat16,
@@ -118,21 +119,31 @@ class Subject200KDataset(Dataset):
         if drop_image:
             condition_img = Image.new("RGB", self.condition_size, (0, 0, 0))
             condition_img_clip = self.clip_image_processor(images=condition_img, return_tensors="pt").pixel_values
-        print(self.to_tensor(target_image).shape)
-        print(condition_img_clip.shape)
         
         return {
             "image": self.to_tensor(target_image),
             "condition_clip": condition_img_clip,
             "condition_type": self.condition_type,
             "prompt": description,
-            **({"pil_image": image} if self.return_pil_image else {}),
+            **({"pil_target_image": target_image,
+                'pil_condition_image': condition_img} if self.return_pil_image else {}),
         }
         
 def collate_fn(data):
+    
     images = torch.stack([example["image"] for example in data])
     clip_images = torch.cat([example["condition_clip"] for example in data], dim=0)
     prompts = [example["prompt"] for example in data]
+    if 'pil_target_image' in data[0]:
+        target_images = [example["pil_target_image"] for example in data]
+        condition_images = [example["pil_condition_image"] for example in data]
+        return {
+            "images": images,
+            "clip_images": clip_images,
+            "prompts": prompts,
+            "pil_target_images": target_images,
+            "pil_condition_images": condition_images,
+        }
     return {
         "images": images,
         "clip_images": clip_images,
@@ -181,7 +192,7 @@ def _encode_prompt_with_t5(
     prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
 
     return prompt_embeds
- 
+
 def _encode_prompt_with_clip(
     text_encoder,
     tokenizer,
@@ -264,6 +275,59 @@ def encode_prompt(
 
     return prompt_embeds, pooled_prompt_embeds, text_ids
 
+def log_test_sample(pipeline, 
+                    test_sample, 
+                    accelerator, 
+                    weight_dtype,
+                    config,
+                    is_final_validation=False):
+    
+    logger.info("Running test sample...")
+    pipeline.set_progress_bar_config(disable=True)
+    
+    # run inference
+    generator = torch.Generator(device=accelerator.device).manual_seed(config.test.seed) if config.test.seed is not None else None
+    autocast_ctx = torch.autocast(accelerator.device.type, weight_dtype) if not is_final_validation else nullcontext()
+    
+    with torch.no_grad():
+        with autocast_ctx:
+            image = pipeline(
+                width=config.dataset.image_size,
+                height=config.dataset.image_size,
+                prompt=test_sample["prompts"],
+                negative_prompt="",
+                true_cfg_scale=config.train.guidance_scale,
+                generator=generator,
+                ip_adapter_image=test_sample["pil_condition_images"],
+                ).images[0]
+            image_no_ip = pipeline(
+                width=config.dataset.image_size,
+                height=config.dataset.image_size,
+                prompt=test_sample["prompts"],
+                negative_prompt="",
+                true_cfg_scale=config.train.guidance_scale,
+                generator=generator,
+                ).images[0]
+            
+        
+    for tracker in accelerator.trackers:
+        phase_name = "test" if is_final_validation else "validation"
+        if tracker.name == "tensorboard":
+            np_images = np.stack([np.asarray(img) for img in images])
+            tracker.writer.add_images(phase_name, np_images, epoch, dataformats="NHWC")
+        if tracker.name == "wandb":
+            tracker.log(
+                {
+                    phase_name: [
+                        wandb.Image(image, caption=f"{test_sample['prompts']}") 
+                    ],
+                    'test_no_ip': [wandb.Image(image_no_ip, caption=f"{test_sample['prompts']}")],
+                    'condition_image': [wandb.Image(test_sample["pil_condition_images"][0], caption="Conditioning")],
+                    'target_image': [wandb.Image(test_sample["pil_target_images"][0], caption="Target")],
+                }
+            )
+    return image
+
 def main():
     
     config_path = os.environ.get('CONFIG_PATH')
@@ -297,6 +361,9 @@ def main():
     total_number_of_trainable_params = sum(p.numel() for p in ip_adapter_trainable_params)
     params_to_optimize = [{'params': ip_adapter_trainable_params, 'lr': config.train.optimizer.lr}]
     
+    if config.gradient_checkpointing:
+        flux_pipeline.transformer.enable_gradient_checkpointing()
+    
     # Dataloader 
     raw_dataset = load_dataset("Yuanshi/Subjects200K")
     # Filter function to filter out low-quality images from Subjects200K
@@ -315,6 +382,10 @@ def main():
         num_proc=4,
         cache_file_name="./cache/dataset/data_valid.arrow",
     )
+    # Split into train/test                                                                             
+    split = data_valid.train_test_split(test_size=0.01, seed=42)                                        
+    test_data_valid = split["test"]                                                                           
+                                                                                                      
     train_dataset = Subject200KDataset(
         data_valid,
         condition_size=tuple(config.dataset.condition_size),
@@ -326,6 +397,18 @@ def main():
         drop_image_prob=config.dataset.drop_image_prob,
         clip_image_processor=flux_pipeline.feature_extractor,
     )
+    test_dataset = Subject200KDataset(
+        test_data_valid,
+        condition_size=tuple(config.dataset.condition_size),
+        target_size=tuple(config.dataset.target_size),
+        image_size=config.dataset.image_size,
+        padding=config.dataset.padding,
+        condition_type=config.dataset.type,
+        drop_text_prob=0.0,
+        drop_image_prob=0.0,
+        clip_image_processor=flux_pipeline.feature_extractor,
+        return_pil_image=True,
+    )
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         shuffle=True,
@@ -333,6 +416,14 @@ def main():
         batch_size=config.train.batch_size,
         num_workers=config.train.dataloader_num_workers,
     ) #[N, C, H, W]
+    test_dataloader = torch.utils.data.DataLoader(
+        test_dataset,
+        shuffle=False,
+        collate_fn=collate_fn,
+        batch_size=config.test.batch_size,
+        num_workers=config.test.dataloader_num_workers,
+    ) #[N, C, H, W]
+    test_iter = iter(test_dataloader)
     
     tokenizers = [flux_pipeline.tokenizer, flux_pipeline.tokenizer_2]
     text_encoders = [flux_pipeline.text_encoder, flux_pipeline.text_encoder_2]
@@ -349,7 +440,6 @@ def main():
     vae_config_scaling_factor = flux_pipeline.vae.config.scaling_factor
     vae_config_block_out_channels = flux_pipeline.vae.config.block_out_channels
     guidance_embeds = flux_pipeline.transformer.config.guidance_embeds
-    
     
     # Initialize optimizer 
     if config.train.optimizer.type == 'adamw':
@@ -482,7 +572,6 @@ def main():
                     accelerator.device,
                     weight_dtype,
                 )
-                print(latent_image_ids.shape)
                 # Sample noise 
                 noise = torch.randn_like(model_input)
                 bsz = model_input.shape[0]
@@ -529,17 +618,15 @@ def main():
                     img_ids=latent_image_ids,
                     return_dict=False,
                 )[0]
-                print(model_pred.shape)
                 model_pred = FluxPipeline._unpack_latents(
                     model_pred,
                     height=model_input.shape[2] * vae_scale_factor,
                     width=model_input.shape[3] * vae_scale_factor,
                     vae_scale_factor=vae_scale_factor,
                 )
-                print(model_pred.shape)
                 # these weighting schemes use a uniform timestep sampling
                 # and instead post-weight the loss
-                weighting = compute_loss_weighting_for_sd3(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
+                weighting = compute_loss_weighting_for_sd3(weighting_scheme=config.train.noise_scheduler.weighting_scheme, sigmas=sigmas)
                 
                 # flow matching loss
                 target = noise - model_input
@@ -552,19 +639,72 @@ def main():
                 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    params_to_clip = (
-                        itertools.chain(transformer.parameters(), text_encoder_one.parameters())
-                        if args.train_text_encoder
-                        else transformer.parameters()
-                    )
-                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                    accelerator.clip_grad_norm_(ip_adapter_trainable_params, config.train.optimizer.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
                 
+            if accelerator.sync_gradients:
+                progress_bar.update(1)
+                global_step += 1
+                if accelerator.is_main_process:
+                    if global_step % config.logging.checkpointing_steps == 0:
+                        if config.logging.checkpoints_total_limit > 0:
+                            checkpoints = os.listdir(config.logging.output_dir)
+                            checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
+                            checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
+                            
+                            # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
+                            if len(checkpoints) >= config.logging.checkpoints_total_limit:
+                                num_to_remove = len(checkpoints) - config.logging.checkpoints_total_limit + 1
+                                removing_checkpoints = checkpoints[0:num_to_remove]
+
+                                logger.info(
+                                    f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
+                                )
+                                logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
+
+                                for removing_checkpoint in removing_checkpoints:
+                                    removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
+                                    shutil.rmtree(removing_checkpoint)
+                        save_path = os.path.join(config.logging.output_dir, f"checkpoint-{global_step}")
+                        accelerator.save_state(save_path)
+                        logger.info(f"Saved state to {save_path}")
+            
+            logs = {"loss": loss.detach().item(), 
+                    "lr": lr_scheduler.get_last_lr()[0]}
+            progress_bar.set_postfix(**logs)
+            accelerator.log(logs, step=global_step)
+            if global_step >= config.train.max_train_steps:
+                break 
+            if step % config.logging.test_steps == 0:
+                transformer.eval()
+                test_sample = next(test_iter)
+                log_test_sample(pipeline=flux_pipeline, 
+                                test_sample=test_sample, 
+                                accelerator=accelerator, 
+                                weight_dtype=weight_dtype, 
+                                config=config, 
+                                is_final_validation=False)
+                transformer.train()
                 
-                exit()
                 
+        
+        # After one epoch, generate test examples for validation  
+        if accelerator.is_main_process:
+            if epoch % config.logging.test_steps == 0:
+                transformer.eval()
+                test_smaple = next(iter(test_dataloader))
+                log_test_sample(pipeline=flux_pipeline, 
+                                test_sample=test_sample, 
+                                accelerator=accelerator, 
+                                weight_dtype=weight_dtype, 
+                                config=config, 
+                                is_final_validation=False)
+                
+                
+                
+                  
                 
 if __name__ == "__main__":
     main()

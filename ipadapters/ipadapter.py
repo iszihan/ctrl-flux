@@ -8,6 +8,7 @@ from diffusers.utils import logging, is_torch_version, is_accelerate_available
 from transformers import CLIPVisionModelWithProjection, CLIPImageProcessor
 import itertools
 
+import torch.nn as nn
 logger = logging.get_logger(__name__)
 
 def setup_ip_adapter(
@@ -89,7 +90,7 @@ def setup_ip_adapter(
                     low_cpu_mem_usage=low_cpu_mem_usage,
                     cache_dir=cache_dir,
                     local_files_only=local_files_only,
-                    torch_dtype=image_encoder_dtype,
+                    torch_dtype=pipeline.dtype,
                 )
                 .to(self.device)
                 .eval()
@@ -148,10 +149,10 @@ def setup_ip_adapter(
             W_ctx = state_dict['context_embedder.weight']
             b_ctx = state_dict['context_embedder.bias']
             attn_weights = {
-                'to_k_ip.0.weight': W_akp @ W_ctx,
-                'to_v_ip.0.weight': W_avp @ W_ctx,
-                'to_k_ip.0.bias': W_akp @ b_ctx + b_akp,
-                'to_v_ip.0.bias': W_avp @ b_ctx + b_avp
+                'to_k_ip.0.weight': torch.zeros_like(W_akp @ W_ctx),
+                'to_v_ip.0.weight': torch.zeros_like(W_avp @ W_ctx),
+                'to_k_ip.0.bias': torch.zeros_like(W_akp @ b_ctx + b_akp),
+                'to_v_ip.0.bias': torch.zeros_like(W_avp @ b_ctx + b_avp)
             }
             attn_procs[name].load_state_dict(attn_weights)
     self.transformer.set_attn_processor(attn_procs)
@@ -166,11 +167,17 @@ def setup_ip_adapter(
         cross_attention_dim=self.transformer.config.joint_attention_dim,
         image_embed_dim=self.image_encoder.config.projection_dim,
         num_image_text_embeds=num_image_text_embeds,
-    )
+    ).to(self.device, dtype=self.dtype)
+    nn.init.zeros_(image_projection.image_embeds.weight)
+    nn.init.zeros_(image_projection.image_embeds.bias)
+    nn.init.zeros_(image_projection.norm.weight)
+    nn.init.zeros_(image_projection.norm.bias)
+    
+    
     image_projection_layers = [image_projection]
-    self.transformer.encoder_hid_proj = MultiIPAdapterImageProjection(image_projection_layers)
+    self.transformer.encoder_hid_proj = MultiIPAdapterImageProjection(image_projection_layers).to(self.device, dtype=self.dtype)
     self.transformer.config.encoder_hid_dim_type = "ip_image_proj"
     
-    trainable_params = itertools.chain(self.transformer.encoder_hid_proj.parameters(), ip_modules.parameters())
+    trainable_params = list(itertools.chain(self.transformer.encoder_hid_proj.parameters(), ip_modules.parameters()))
     return trainable_params
  
