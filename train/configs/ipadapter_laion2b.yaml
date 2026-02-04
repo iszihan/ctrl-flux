@@ -4,10 +4,10 @@ dtype: "bf16"
 resume_from_checkpoint: false
 cache_latents: false
 gradient_checkpointing: true
-expname: "debug"
+expname: "ipflux-laion2b-4gpu"
 
 dataset:
-  type: "subject"
+  type: "laion2b"
   condition_size:
     - 512
     - 512
@@ -20,15 +20,19 @@ dataset:
   drop_image_prob: 0.1
   drop_last: false
   # for laion2B
+  resampled: false
+  shuffle_buffer: 200
   shards_path: ./dataset/laion2B/laion_wds_512
   train_shard_pattern: "{00001..00099}.tar"
   test_shard_pattern: "{00000..00001}.tar"
+  train_dataloader_num_workers: 4
+  test_dataloader_num_workers: 1
 
 train:
   num_train_epochs: 4
+  max_train_steps: 1000000  # Required for WebDataset (no len())
   batch_size: 4
   gradient_accumulation_steps: 1
-  dataloader_num_workers: 4
   guidance_scale: 3.5
   optimizer: 
     type: 'adamw'
@@ -50,6 +54,7 @@ train:
     mode_scale: 1.29 # for 'mode' weighting scheme
   text_encoder:
     max_sequence_length: 512
+
 test:
   seed: 42
   batch_size: 1

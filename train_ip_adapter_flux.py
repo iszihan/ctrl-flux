@@ -1,5 +1,7 @@
 import os
-import torch 
+import gc
+import torch
+import torch.nn.functional as F
 from omegaconf import OmegaConf 
 import math
 from typing import Optional, Union                                                                     
@@ -10,7 +12,6 @@ from pathlib import Path
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration
-
 from diffusers.models.transformers.transformer_flux import FluxIPAdapterAttnProcessor              
 from diffusers.optimization import get_scheduler
 from diffusers.pipelines import FluxPipeline
@@ -24,6 +25,7 @@ import random
 import numpy as np
 from PIL import Image
 import wandb
+from dataset.ipadapter_dataset import build_subject200k_dataloader, build_laion2B_dataloader, build_laion2B_local_dataloader
 
 DTYPE_MAP = {
     "bf16": torch.bfloat16,
@@ -45,113 +47,6 @@ logging.basicConfig(
         level=logging.INFO,
     )
 logger = get_logger(__name__)
-
-class Subject200KDataset(Dataset):
-    def __init__(
-        self,
-        base_dataset,
-        condition_size=(512, 512),
-        target_size=(512, 512),
-        image_size: int = 512,
-        padding: int = 0,
-        condition_type: str = "subject",
-        drop_text_prob: float = 0.1,
-        drop_image_prob: float = 0.1,
-        return_pil_image: bool = False,
-        clip_image_processor: CLIPImageProcessor = None,
-    ):
-        self.base_dataset = base_dataset
-        self.condition_size = condition_size
-        self.target_size = target_size
-        self.image_size = image_size
-        self.padding = padding
-        self.condition_type = condition_type
-        self.drop_text_prob = drop_text_prob
-        self.drop_image_prob = drop_image_prob
-        self.return_pil_image = return_pil_image
-
-        self.to_tensor = T.ToTensor()
-        self.clip_image_processor = clip_image_processor
-
-    def __len__(self):
-        return len(self.base_dataset) * 2
-
-    def __getitem__(self, idx):
-        # If target is 0, left image is target, right image is condition
-        target = idx % 2
-        item = self.base_dataset[idx // 2]
-
-        # Crop the image to target and condition
-        image = item["image"]
-        left_img = image.crop(
-            (
-                self.padding,
-                self.padding,
-                self.image_size + self.padding,
-                self.image_size + self.padding,
-            )
-        )
-        right_img = image.crop(
-            (
-                self.image_size + self.padding * 2,
-                self.padding,
-                self.image_size * 2 + self.padding * 2,
-                self.image_size + self.padding,
-            )
-        )
-
-        # Get the target and condition image
-        target_image, condition_img = (
-            (left_img, right_img) if target == 0 else (right_img, left_img)
-        )
-        condition_img_clip = self.clip_image_processor(images=condition_img, return_tensors="pt").pixel_values
-
-        # Resize the image
-        target_image = target_image.resize(self.target_size).convert("RGB")
-
-        # Get the description
-        description = item["description"][
-            "description_0" if target == 0 else "description_1"
-        ]
-
-        # Randomly drop text or image
-        drop_text = random.random() < self.drop_text_prob
-        drop_image = random.random() < self.drop_image_prob
-        if drop_text:
-            description = ""
-        if drop_image:
-            condition_img = Image.new("RGB", self.condition_size, (0, 0, 0))
-            condition_img_clip = self.clip_image_processor(images=condition_img, return_tensors="pt").pixel_values
-        
-        return {
-            "image": self.to_tensor(target_image),
-            "condition_clip": condition_img_clip,
-            "condition_type": self.condition_type,
-            "prompt": description,
-            **({"pil_target_image": target_image,
-                'pil_condition_image': condition_img} if self.return_pil_image else {}),
-        }
-        
-def collate_fn(data):
-    
-    images = torch.stack([example["image"] for example in data])
-    clip_images = torch.cat([example["condition_clip"] for example in data], dim=0)
-    prompts = [example["prompt"] for example in data]
-    if 'pil_target_image' in data[0]:
-        target_images = [example["pil_target_image"] for example in data]
-        condition_images = [example["pil_condition_image"] for example in data]
-        return {
-            "images": images,
-            "clip_images": clip_images,
-            "prompts": prompts,
-            "pil_target_images": target_images,
-            "pil_condition_images": condition_images,
-        }
-    return {
-        "images": images,
-        "clip_images": clip_images,
-        "prompts": prompts,
-    }
 
 def _encode_prompt_with_t5(
     text_encoder,
@@ -277,7 +172,6 @@ def encode_prompt(
     text_ids = torch.zeros(prompt_embeds.shape[1], 3).to(device=device, dtype=dtype)
 
     return prompt_embeds, pooled_prompt_embeds, text_ids
-
 
 def save_ip_adapter(                                                                                   
       pipeline,                
@@ -445,10 +339,10 @@ def create_ip_adapter_hooks(accelerator, transformer):
       def load_model_hook(models, input_dir):                                                            
           while len(models) > 0:                                                                         
               model = models.pop()                                                                       
-              unwrapped = unwrap_model(model)                                                            
+              unwrapped = accelerator.unwrap_model(model)                                                            
                                                                                                          
               # Check if this is the transformer with IP adapter                                         
-              if isinstance(unwrapped, type(unwrap_model(transformer))):                                 
+              if isinstance(unwrapped, type(accelerator.unwrap_model(transformer))):                                 
                   load_path = os.path.join(input_dir, "ip_adapter.safetensors")                          
                                                                                                          
                   if not os.path.exists(load_path):                                                      
@@ -498,7 +392,6 @@ def create_ip_adapter_hooks(accelerator, transformer):
                                                                                                          
       return save_model_hook, load_model_hook                                                            
                                                            
-  
 def log_test_sample(pipeline, 
                     test_sample, 
                     accelerator, 
@@ -522,7 +415,7 @@ def log_test_sample(pipeline,
                 negative_prompt="",
                 true_cfg_scale=config.train.guidance_scale,
                 generator=generator,
-                ip_adapter_image=test_sample["pil_condition_images"],
+                ip_adapter_image=test_sample["clip_images"],
                 ).images[0]
             image_no_ip = pipeline(
                 width=config.dataset.image_size,
@@ -532,7 +425,30 @@ def log_test_sample(pipeline,
                 true_cfg_scale=config.train.guidance_scale,
                 generator=generator,
                 ).images[0]
-            
+    
+    # Compute CLIP image-to-image similarity using torchmetrics
+    target_image_pil = test_sample["pil_target_images"][0]
+    condition_image_pil = test_sample["pil_condition_images"][0]
+    
+    # Convert PIL images to tensors [N, C, H, W] with values in [0, 255] as uint8
+    to_tensor = T.ToTensor()
+    gen_tensor = (to_tensor(image) * 255).to(torch.uint8).unsqueeze(0).to(accelerator.device)
+    target_tensor = (to_tensor(target_image_pil) * 255).to(torch.uint8).unsqueeze(0).to(accelerator.device)
+    
+    with torch.no_grad():
+        # pipeline's image_encoder + cosine similarity
+        gen_inputs = pipeline.feature_extractor(images=image, return_tensors="pt").pixel_values.to(accelerator.device, dtype=weight_dtype)
+        target_inputs = pipeline.feature_extractor(images=target_image_pil, return_tensors="pt").pixel_values.to(accelerator.device, dtype=weight_dtype)
+        
+        gen_embed = pipeline.image_encoder(gen_inputs).image_embeds
+        target_embed = pipeline.image_encoder(target_inputs).image_embeds
+        gen_embed = gen_embed / gen_embed.norm(dim=-1, keepdim=True)
+        target_embed = target_embed / target_embed.norm(dim=-1, keepdim=True)
+        
+        clip_sim_pipeline = F.cosine_similarity(gen_embed, target_embed).item() * 100
+        
+        # Log comparison for debugging
+        logger.info(f"CLIP sim (pipeline): {clip_sim_pipeline:.4f}")
         
     for tracker in accelerator.trackers:
         phase_name = "test" if is_final_validation else "validation"
@@ -548,6 +464,7 @@ def log_test_sample(pipeline,
                     'test_no_ip': [wandb.Image(image_no_ip, caption=f"{test_sample['prompts']}")],
                     'condition_image': [wandb.Image(test_sample["pil_condition_images"][0], caption="Conditioning")],
                     'target_image': [wandb.Image(test_sample["pil_target_images"][0], caption="Target")],
+                    'clip_sim_pipeline': clip_sim_pipeline,
                 }
             )
     return image
@@ -557,6 +474,8 @@ def main():
     config_path = os.environ.get('CONFIG_PATH')
     assert config_path is not None, "Please set the CONFIG_PATH environment variable."
     config = OmegaConf.load(config_path)
+    cli = OmegaConf.from_cli()
+    config = OmegaConf.merge(config, cli)
     
     # Initialize the accelerator
     config.logging.output_dir = Path(config.logging.output_dir, config.expname)
@@ -592,64 +511,62 @@ def main():
         flux_pipeline.transformer.enable_gradient_checkpointing()
     
     # Dataloader 
-    raw_dataset = load_dataset("Yuanshi/Subjects200K")
-    # Filter function to filter out low-quality images from Subjects200K
-    def filter_func(item):
-        if not item.get("quality_assessment"):
-            return False
-        return all(
-            item["quality_assessment"].get(key, 0) >= 5
-            for key in ["compositeStructure", "objectConsistency", "imageQuality"]
+    if config.dataset.type == 'subject':
+        raw_dataset = load_dataset("Yuanshi/Subjects200K")
+        # Filter function to filter out low-quality images from Subjects200K
+        def filter_func(item):
+            if not item.get("quality_assessment"):
+                return False
+            return all(
+                item["quality_assessment"].get(key, 0) >= 5
+                for key in ["compositeStructure", "objectConsistency", "imageQuality"]
+            )
+        # Filter dataset
+        if not os.path.exists("./cache/dataset"):
+            os.makedirs("./cache/dataset")
+        data_valid = raw_dataset["train"].filter(
+            filter_func,
+            num_proc=4,
+            cache_file_name="./cache/dataset/data_valid.arrow",
         )
-    # Filter dataset
-    if not os.path.exists("./cache/dataset"):
-        os.makedirs("./cache/dataset")
-    data_valid = raw_dataset["train"].filter(
-        filter_func,
-        num_proc=4,
-        cache_file_name="./cache/dataset/data_valid.arrow",
-    )
-    # Split into train/test                                                                             
-    split = data_valid.train_test_split(test_size=0.01, seed=42)                                        
-    test_data_valid = split["test"]                                                                           
-                                                                                                      
-    train_dataset = Subject200KDataset(
-        data_valid,
-        condition_size=tuple(config.dataset.condition_size),
-        target_size=tuple(config.dataset.target_size),
-        image_size=config.dataset.image_size,
-        padding=config.dataset.padding,
-        condition_type=config.dataset.type,
-        drop_text_prob=config.dataset.drop_text_prob,
-        drop_image_prob=config.dataset.drop_image_prob,
-        clip_image_processor=flux_pipeline.feature_extractor,
-    )
-    test_dataset = Subject200KDataset(
-        test_data_valid,
-        condition_size=tuple(config.dataset.condition_size),
-        target_size=tuple(config.dataset.target_size),
-        image_size=config.dataset.image_size,
-        padding=config.dataset.padding,
-        condition_type=config.dataset.type,
-        drop_text_prob=0.0,
-        drop_image_prob=0.0,
-        clip_image_processor=flux_pipeline.feature_extractor,
-        return_pil_image=True,
-    )
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset,
-        shuffle=True,
-        collate_fn=collate_fn,
-        batch_size=config.train.batch_size,
-        num_workers=config.train.dataloader_num_workers,
-    ) #[N, C, H, W]
-    test_dataloader = torch.utils.data.DataLoader(
-        test_dataset,
-        shuffle=False,
-        collate_fn=collate_fn,
-        batch_size=config.test.batch_size,
-        num_workers=config.test.dataloader_num_workers,
-    ) #[N, C, H, W]
+        # Split into train/test                                                                           
+        split = data_valid.train_test_split(test_size=0.01, seed=42)                                        
+        test_data_valid = split["test"] 
+        # Build dataloaders
+        train_dataloader = build_subject200k_dataloader(data_valid, flux_pipeline.feature_extractor, config, split='train')
+        test_dataloader = build_subject200k_dataloader(test_data_valid, flux_pipeline.feature_extractor, config, split='test')                                                                          
+    elif config.dataset.type == 'laion2b':
+        # Pass rank/world_size for multi-GPU shard splitting (since we don't use accelerator.prepare for WebDataset)
+        train_dataloader = build_laion2B_dataloader(
+            config.dataset.shards_path + "/" + config.dataset.train_shard_pattern, 
+            flux_pipeline.feature_extractor, 
+            config, 
+            split='train',
+            rank=accelerator.process_index,
+            world_size=accelerator.num_processes
+        )
+        # Don't shard test dataloader - all GPUs see same test data (fewer shards than GPUs typically)
+        test_dataloader = build_laion2B_dataloader(
+            config.dataset.shards_path + "/" + config.dataset.test_shard_pattern, 
+            flux_pipeline.feature_extractor, 
+            config, 
+            split='test',
+            rank=0,  # no sharding for test
+            world_size=1
+        )
+    elif config.dataset.type == 'laion2b_local':
+        train_dataloader = build_laion2B_local_dataloader(
+            config.dataset.train_data_dir,
+            flux_pipeline.feature_extractor,
+            config,
+            split='train'
+        )
+        test_dataloader = build_laion2B_local_dataloader(
+            config.dataset.test_data_dir,
+            flux_pipeline.feature_extractor,
+            config,
+            split='test'
+        )                                                                          
     test_iter = iter(test_dataloader)
     
     tokenizers = [flux_pipeline.tokenizer, flux_pipeline.tokenizer_2]
@@ -704,24 +621,32 @@ def main():
     accelerator.register_save_state_pre_hook(save_model_hook)
     accelerator.register_load_state_pre_hook(load_model_hook)
     
-    transformer, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        flux_pipeline.transformer, optimizer, train_dataloader, lr_scheduler
+    # For WebDataset (IterableDataset), don't prepare the dataloader - accelerate can't
+    # concatenate non-tensor data (strings) across processes. WebDataset handles its own sharding.
+    if config.dataset.type == 'laion2b':
+        transformer, optimizer, lr_scheduler = accelerator.prepare(
+            flux_pipeline.transformer, optimizer, lr_scheduler
+        )
+    else:
+        transformer, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            flux_pipeline.transformer, optimizer, train_dataloader, lr_scheduler
         )
     # reassign the wrapped transformer to the flux pipeline
     flux_pipeline.transformer = transformer
     
-    # We need to recalculate our total training steps as the size of the training dataloader may have changed.
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / config.train.gradient_accumulation_steps)
-    if 'max_train_steps' not in config.train:
-        config.train.max_train_steps = config.train.num_train_epochs * num_update_steps_per_epoch
-        if num_training_steps_for_scheduler != config.train.max_train_steps:
-            logger.warning(
-                f"The length of the 'train_dataloader' after 'accelerator.prepare' ({len(train_dataloader)}) does not match "
-                f"the expected length ({len_train_dataloader_after_sharding}) when the learning rate scheduler was created. "
-                f"This inconsistency may result in the learning rate scheduler not functioning properly."
-            )
-    # Afterwards we recalculate our number of training epochs
-    config.train.num_train_epochs = math.ceil(config.train.max_train_steps / num_update_steps_per_epoch)
+    if config.dataset.type in ['subject', 'laion2b_local']:
+        # We need to recalculate our total training steps as the size of the training dataloader may have changed.
+        num_update_steps_per_epoch = math.ceil(len(train_dataloader) / config.train.gradient_accumulation_steps)
+        if 'max_train_steps' not in config.train:
+            config.train.max_train_steps = config.train.num_train_epochs * num_update_steps_per_epoch
+            if num_training_steps_for_scheduler != config.train.max_train_steps:
+                logger.warning(
+                    f"The length of the 'train_dataloader' after 'accelerator.prepare' ({len(train_dataloader)}) does not match "
+                    f"the expected length ({len_train_dataloader_after_sharding}) when the learning rate scheduler was created. "
+                    f"This inconsistency may result in the learning rate scheduler not functioning properly."
+                )
+        # Afterwards we recalculate our number of training epochs
+        config.train.num_train_epochs = math.ceil(config.train.max_train_steps / num_update_steps_per_epoch)
     
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
@@ -733,9 +658,9 @@ def main():
     total_batch_size = config.train.batch_size * accelerator.num_processes * config.train.gradient_accumulation_steps
     logger.info("***** Running training *****")
     logger.info(f"  Total number of trainable parameters = {total_number_of_trainable_params/1e6:.2f}M")
-    logger.info(f"  Num examples = {len(train_dataset)}")
-    logger.info(f"  Num batches each epoch = {len(train_dataloader)}")
-    logger.info(f"  Num Epochs = {config.train.num_train_epochs}")
+    # logger.info(f"  Num examples = {len(train_dataset)}")
+    # logger.info(f"  Num batches each epoch = {len(train_dataloader)}")
+    # logger.info(f"  Num Epochs = {config.train.num_train_epochs}")
     logger.info(f"  Instantaneous batch size per device = {config.train.batch_size}")
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {config.train.gradient_accumulation_steps}")
@@ -744,13 +669,20 @@ def main():
     first_epoch = 0
     
     if config.resume_from_checkpoint:
-        # TODO: Implement resume from checkpoint
-        raise ValueError("Resume from checkpoint is not supported yet.")
+        if config.resume_path is not None:
+            logger.info(f"Resuming from checkpoint {config.resume_path}.")
+            accelerator.load_state(config.resume_path)
+            global_step = int(os.path.basename(config.resume_path).split("-")[1])
+            initial_global_step = global_step
+            first_epoch = global_step // num_update_steps_per_epoch
+        else:
+            # TODO: implement resume from latest checkpoint by default
+            raise ValueError("Resume path is not set.")
     else:
         initial_global_step = 0
-        
+    
     progress_bar = tqdm(
-        range(0, config.train.max_train_steps),
+        range(initial_global_step, config.train.max_train_steps),
         initial=initial_global_step,
         desc="Steps",
         # Only show the progress bar once on each machine.
@@ -769,9 +701,12 @@ def main():
         return sigma
     
     # Training Loop
-    for epoch in range(config.train.num_train_epochs):
+    # for epoch in range(first_epoch, config.train.num_train_epochs):
+    while global_step < config.train.max_train_steps:
         transformer.train()
         for step, batch in enumerate(train_dataloader):
+            if batch is None:
+                continue
             with accelerator.accumulate(transformer):
                 # Compute the text embeddings from prompts
                 prompts = batch["prompts"]
@@ -780,7 +715,7 @@ def main():
                         )
                 
                 # Compute ID-Adapter image embeddings 
-                condition_clip = batch["clip_images"].to(dtype=weight_dtype)
+                condition_clip = batch["clip_images"].to(device=accelerator.device, dtype=weight_dtype)
                 image_embeds = flux_pipeline.encode_image(condition_clip, accelerator.device, 1) # [B, 768]
                 joint_attention_kwargs = {"ip_adapter_image_embeds": image_embeds}
                 
@@ -789,7 +724,7 @@ def main():
                     # TODO: Implement cache latents
                     raise ValueError("Cache latents is not supported yet.")
                 else:
-                    images = batch["images"].to(dtype=flux_pipeline.vae.dtype)
+                    images = batch["images"].to(device=accelerator.device, dtype=flux_pipeline.vae.dtype)
                     model_input = flux_pipeline.vae.encode(images).latent_dist.sample()
                 model_input = (model_input - vae_config_shift_factor) * vae_config_scaling_factor
                 model_input = model_input.to(dtype=weight_dtype)
@@ -882,8 +817,8 @@ def main():
                     if global_step % config.logging.checkpointing_steps == 0:
                         if config.logging.checkpoints_total_limit > 0:
                             checkpoints = os.listdir(config.logging.output_dir)
-                            checkpoints = [d for d in checkpoints if d.endswith("safetensors")]
-                            checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1].split(".")[0]))
+                            checkpoints = [d for d in checkpoints if os.path.isdir(d) and d.starts("ip_adapter-")]
+                            checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
                             
                             # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
                             if len(checkpoints) >= config.logging.checkpoints_total_limit:
@@ -898,44 +833,46 @@ def main():
                                 for removing_checkpoint in removing_checkpoints:
                                     removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
                                     shutil.rmtree(removing_checkpoint)
-                        # save_ip_adapter(pipeline=flux_pipeline,
-                        #                 accelerator=accelerator,
-                        #                 save_directory=config.logging.output_dir,
-                        #                 weight_name=f"ip_adapter-{global_step:06d}.safetensors",
-                        #                 safe_serialization=True,
-                        #                 adapter_index=0)
                         accelerator.save_state(f"{config.logging.output_dir}/ip_adapter-{global_step:06d}", safe_serialization=True)
                         logger.info(f"Saved state to {config.logging.output_dir}/ip_adapter-{global_step:06d}.safetensors")
-                        exit()
                         
-            
             logs = {"loss": loss.detach().item(), 
                     "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
+                
             if global_step >= config.train.max_train_steps:
                 break 
             
             # Generate test samples every N steps
-            if step % config.logging.test_steps == 0 and accelerator.is_main_process:
-                transformer.eval()
-                test_sample = next(test_iter)
-                # Temporarily unwrap the transformer for inference
-                # DDP wrapping breaks pipeline access to transformer.config
-                flux_pipeline.transformer = accelerator.unwrap_model(transformer)
-                log_test_sample(pipeline=flux_pipeline,
-                                test_sample=test_sample,
-                                accelerator=accelerator,
-                                weight_dtype=weight_dtype,
-                                config=config,
-                                is_final_validation=False)
-                # Restore the wrapped transformer for training
-                flux_pipeline.transformer = transformer
-                transformer.train()
+            if global_step % config.logging.test_steps == 0:
+                # Sync all GPUs before test generation to prevent OOM
+                accelerator.wait_for_everyone()
+                if accelerator.is_main_process:
+                    transformer.eval()
+                    test_sample = next(test_iter)
+                    # Temporarily unwrap the transformer for inference
+                    # DDP wrapping breaks pipeline access to transformer.config
+                    flux_pipeline.transformer = accelerator.unwrap_model(transformer)
+                    log_test_sample(pipeline=flux_pipeline,
+                                    test_sample=test_sample,
+                                    accelerator=accelerator,
+                                    weight_dtype=weight_dtype,
+                                    config=config,
+                                    is_final_validation=False)
+                    # Restore the wrapped transformer for training
+                    flux_pipeline.transformer = transformer
+                    transformer.train()
+                    # Clear cache to prevent OOM
+                    torch.cuda.empty_cache()
+                # Sync again before resuming training
+                accelerator.wait_for_everyone()
                 
         # After one epoch, generate test examples for validation
-        if accelerator.is_main_process:
-            if epoch % config.logging.test_steps == 0:
+        if epoch % config.logging.test_steps == 0:
+            # Sync all GPUs before test generation to prevent OOM
+            accelerator.wait_for_everyone()
+            if accelerator.is_main_process:
                 transformer.eval()
                 test_sample = next(iter(test_dataloader))
                 # Temporarily unwrap the transformer for inference
@@ -948,11 +885,11 @@ def main():
                                 is_final_validation=False)
                 # Restore the wrapped transformer for training
                 flux_pipeline.transformer = transformer
-                transformer.train()
-                
-                
-                
-                  
-                
+                # Clear cache to prevent OOM
+                torch.cuda.empty_cache()
+                # Sync again before resuming training
+            accelerator.wait_for_everyone()
+            transformer.train()
+                              
 if __name__ == "__main__":
     main()

@@ -18,15 +18,10 @@ dataset:
   padding: 8
   drop_text_prob: 0.1
   drop_image_prob: 0.1
-  drop_last: false
-  # for laion2B
-  shards_path: ./dataset/laion2B/laion_wds_512
-  train_shard_pattern: "{00001..00099}.tar"
-  test_shard_pattern: "{00000..00001}.tar"
 
 train:
   num_train_epochs: 4
-  batch_size: 4
+  batch_size: 8
   gradient_accumulation_steps: 1
   dataloader_num_workers: 4
   guidance_scale: 3.5

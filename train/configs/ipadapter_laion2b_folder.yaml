@@ -4,10 +4,10 @@ dtype: "bf16"
 resume_from_checkpoint: false
 cache_latents: false
 gradient_checkpointing: true
-expname: "debug"
+expname: "ipflux-laion2b-folder"
 
 dataset:
-  type: "subject"
+  type: "laion2b_folder"  # Use folder-based dataset instead of WebDataset
   condition_size:
     - 512
     - 512
@@ -19,16 +19,17 @@ dataset:
   drop_text_prob: 0.1
   drop_image_prob: 0.1
   drop_last: false
-  # for laion2B
-  shards_path: ./dataset/laion2B/laion_wds_512
-  train_shard_pattern: "{00001..00099}.tar"
-  test_shard_pattern: "{00000..00001}.tar"
+  # Paths to extracted data folders
+  train_data_dir: ./dataset/laion2B/extracted_train
+  test_data_dir: ./dataset/laion2B/extracted_test
+  train_dataloader_num_workers: 4
+  test_dataloader_num_workers: 1
 
 train:
   num_train_epochs: 4
+  # max_train_steps not needed - will be calculated from dataset length
   batch_size: 4
   gradient_accumulation_steps: 1
-  dataloader_num_workers: 4
   guidance_scale: 3.5
   optimizer: 
     type: 'adamw'
@@ -45,11 +46,12 @@ train:
     power: 1.0
   noise_scheduler:
     weighting_scheme: 'none'
-    logit_mean: 0.0 # for 'logit_normal' weighting scheme
-    logit_std: 1.0 # for 'logit_normal' weighting scheme
-    mode_scale: 1.29 # for 'mode' weighting scheme
+    logit_mean: 0.0
+    logit_std: 1.0
+    mode_scale: 1.29
   text_encoder:
     max_sequence_length: 512
+
 test:
   seed: 42
   batch_size: 1

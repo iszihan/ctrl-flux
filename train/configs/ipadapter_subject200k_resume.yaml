@@ -1,10 +1,11 @@
 flux_path: "black-forest-labs/FLUX.1-dev"
 image_encoder_path: "openai/clip-vit-large-patch14"
 dtype: "bf16"
-resume_from_checkpoint: false
+resume_from_checkpoint: true
+resume_path: "runs/ipflux-4gpu-resume/ip_adapter-056000"
 cache_latents: false
 gradient_checkpointing: true
-expname: "debug"
+expname: "ipflux-4gpu-resume"
 
 dataset:
   type: "subject"
@@ -18,17 +19,14 @@ dataset:
   padding: 8
   drop_text_prob: 0.1
   drop_image_prob: 0.1
-  drop_last: false
-  # for laion2B
-  shards_path: ./dataset/laion2B/laion_wds_512
-  train_shard_pattern: "{00001..00099}.tar"
-  test_shard_pattern: "{00000..00001}.tar"
+  train_dataloader_num_workers: 4
+  test_dataloader_num_workers: 1
+
 
 train:
   num_train_epochs: 4
   batch_size: 4
   gradient_accumulation_steps: 1
-  dataloader_num_workers: 4
   guidance_scale: 3.5
   optimizer: 
     type: 'adamw'
