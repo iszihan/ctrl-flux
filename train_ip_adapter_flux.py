@@ -867,29 +867,6 @@ def main():
                     torch.cuda.empty_cache()
                 # Sync again before resuming training
                 accelerator.wait_for_everyone()
-                
-        # After one epoch, generate test examples for validation
-        if epoch % config.logging.test_steps == 0:
-            # Sync all GPUs before test generation to prevent OOM
-            accelerator.wait_for_everyone()
-            if accelerator.is_main_process:
-                transformer.eval()
-                test_sample = next(iter(test_dataloader))
-                # Temporarily unwrap the transformer for inference
-                flux_pipeline.transformer = accelerator.unwrap_model(transformer)
-                log_test_sample(pipeline=flux_pipeline,
-                                test_sample=test_sample,
-                                accelerator=accelerator,
-                                weight_dtype=weight_dtype,
-                                config=config,
-                                is_final_validation=False)
-                # Restore the wrapped transformer for training
-                flux_pipeline.transformer = transformer
-                # Clear cache to prevent OOM
-                torch.cuda.empty_cache()
-                # Sync again before resuming training
-            accelerator.wait_for_everyone()
-            transformer.train()
-                              
+                      
 if __name__ == "__main__":
     main()
