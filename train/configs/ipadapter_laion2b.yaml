@@ -4,7 +4,7 @@ dtype: "bf16"
 resume_from_checkpoint: false
 cache_latents: false
 gradient_checkpointing: true
-expname: "ipflux-laion2b-4gpu"
+expname: "ipflux-laion2b-4l40s-nonzeroinit"
 
 dataset:
   type: "laion2b"
@@ -60,6 +60,14 @@ test:
   batch_size: 1
   dataloader_num_workers: 1
 
+validations:
+  images:
+  - "./dataset/test/sculpture.jpg"
+  - "./dataset/test/girlwpearl.jpg" 
+  prompts:
+  - "wearing sunglasses"
+  - "wearing red scarf"
+
 logging:
   output_dir: "runs"
   logging_dir: "logs"
@@ -67,4 +75,4 @@ logging:
   checkpointing_steps: 1000
   checkpoints_total_limit: 10
   test_steps: 200
-  validation_epochs: 1
+  validation_steps: 500

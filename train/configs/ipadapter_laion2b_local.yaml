@@ -1,14 +1,13 @@
 flux_path: "black-forest-labs/FLUX.1-dev"
 image_encoder_path: "openai/clip-vit-large-patch14"
 dtype: "bf16"
-resume_from_checkpoint: true
-resume_path: "runs/ipflux-subject200k-4gpu/ip_adapter-059000"
+resume_from_checkpoint: false
 cache_latents: false
 gradient_checkpointing: true
-expname: "ipflux-subject200k-4gpu"
+expname: "ipflux-laion2b-local"
 
 dataset:
-  type: "subject"
+  type: "laion2b_local"  # Use folder-based dataset instead of WebDataset
   condition_size:
     - 512
     - 512
@@ -19,12 +18,16 @@ dataset:
   padding: 8
   drop_text_prob: 0.1
   drop_image_prob: 0.1
+  drop_last: false
+  # Paths to extracted data folders
+  train_data_dir: ./dataset/laion2B/extracted_train
+  test_data_dir: ./dataset/laion2B/extracted_test
   train_dataloader_num_workers: 4
   test_dataloader_num_workers: 1
 
-
 train:
   num_train_epochs: 4
+  # max_train_steps not needed - will be calculated from dataset length
   batch_size: 4
   gradient_accumulation_steps: 1
   guidance_scale: 3.5
@@ -43,23 +46,16 @@ train:
     power: 1.0
   noise_scheduler:
     weighting_scheme: 'none'
-    logit_mean: 0.0 # for 'logit_normal' weighting scheme
-    logit_std: 1.0 # for 'logit_normal' weighting scheme
-    mode_scale: 1.29 # for 'mode' weighting scheme
+    logit_mean: 0.0
+    logit_std: 1.0
+    mode_scale: 1.29
   text_encoder:
     max_sequence_length: 512
+
 test:
   seed: 42
   batch_size: 1
   dataloader_num_workers: 1
-
-validations:
-  images:
-  - "./dataset/test/sculpture.jpg"
-  - "./dataset/test/girlwpearl.jpg" 
-  prompts:
-  - "wearing sunglasses"
-  - "wearing red scarf"
 
 logging:
   output_dir: "runs"
@@ -68,4 +64,4 @@ logging:
   checkpointing_steps: 1000
   checkpoints_total_limit: 10
   test_steps: 200
-  validation_steps: 500
+  validation_epochs: 1

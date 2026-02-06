@@ -1,8 +1,8 @@
 #!/bin/bash
-#SBATCH --job-name=ipflux4_laion2b            # change if needed
-#SBATCH --gres=gpu:l40s:4
-#SBATCH --cpus-per-task=32  # 4 GPUs × 4 workers = 16 workers + overhead
-#SBATCH --mem=96G  # increased from 48G to prevent CPU OOM
+#SBATCH --job-name=ipflux_laion2b_8h100s            # change if needed
+#SBATCH --gres=gpu:h100:8
+#SBATCH --cpus-per-task=64  # 8 GPUs × 8 workers = 64 workers + overhead
+#SBATCH --mem=128G  # increased from 48G to prevent CPU OOM
 #SBATCH --time=48:00:00
 #SBATCH --output=/project/aip-jacobson/zling/ctrl-flux/logs/%x_%j.out
 #SBATCH --error=/project/aip-jacobson/zling/ctrl-flux/logs/%x_%j.err
@@ -30,9 +30,9 @@ source venv/bin/activate
 export CONFIG_PATH=./train/configs/ipadapter_laion2b.yaml
 
 accelerate launch \
-    --num_processes 4 \
+    --num_processes 8 \
     --main_process_port 41353 \
-    -m train_ip_adapter_flux expname=ipflux-laion2b-4l40s-nonzeroinit
+    -m train_ip_adapter_flux expname=ipflux-laion2b-8h100s
 
 # Cleanup: kill memory monitor
 kill $MONITOR_PID 2>/dev/null

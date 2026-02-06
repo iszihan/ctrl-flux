@@ -148,9 +148,13 @@ def setup_ip_adapter(
             b_avp = state_dict[name.split(".processor")[0]+'.add_v_proj.bias']
             W_ctx = state_dict['context_embedder.weight']
             b_ctx = state_dict['context_embedder.bias']
+            # Use small random init for weights (zero causes zero gradients!)
+            # Scale by 0.01 to start with small effect
+            k_weight = torch.randn_like(W_akp @ W_ctx) * 0.01
+            v_weight = torch.randn_like(W_avp @ W_ctx) * 0.01
             attn_weights = {
-                'to_k_ip.0.weight': torch.zeros_like(W_akp @ W_ctx),
-                'to_v_ip.0.weight': torch.zeros_like(W_avp @ W_ctx),
+                'to_k_ip.0.weight': k_weight,
+                'to_v_ip.0.weight': v_weight,
                 'to_k_ip.0.bias': torch.zeros_like(W_akp @ b_ctx + b_akp),
                 'to_v_ip.0.bias': torch.zeros_like(W_avp @ b_ctx + b_avp)
             }
@@ -168,9 +172,12 @@ def setup_ip_adapter(
         image_embed_dim=self.image_encoder.config.projection_dim,
         num_image_text_embeds=num_image_text_embeds,
     ).to(self.device, dtype=self.dtype)
-    nn.init.zeros_(image_projection.image_embeds.weight)
+    # Use small random init instead of zeros - zero weights cause zero gradients!
+    # Xavier init for weights, zero for biases (standard practice)
+    nn.init.xavier_uniform_(image_projection.image_embeds.weight)
     nn.init.zeros_(image_projection.image_embeds.bias)
-    nn.init.zeros_(image_projection.norm.weight)
+    # LayerNorm: weight=1, bias=0 (default behavior)
+    nn.init.ones_(image_projection.norm.weight)
     nn.init.zeros_(image_projection.norm.bias)
     
     
