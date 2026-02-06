@@ -392,19 +392,103 @@ def create_ip_adapter_hooks(accelerator, transformer):
                                                                                                          
       return save_model_hook, load_model_hook                                                            
                                                            
+def log_validation_samples(pipeline, 
+                           validation_data,
+                           accelerator, 
+                           weight_dtype,
+                           config,
+                           global_step=None,
+                           ):
+    """
+    Run validation using pre-loaded validation images.
+    
+    Args:
+        validation_data: Dict with 'pil_images', 'clip_images', 'prompts' (pre-loaded once)
+    """
+    if validation_data is None:
+        logger.warning("No validation data provided, skipping validation")
+        return None
+        
+    logger.info("Running validation samples...")
+    pipeline.set_progress_bar_config(disable=True)
+    
+    generator = torch.Generator(device=accelerator.device).manual_seed(config.test.seed) if config.test.seed is not None else None
+    autocast_ctx = torch.autocast(accelerator.device.type, weight_dtype)
+    
+    all_images = []
+    for i, (pil_img, prompt) in enumerate(zip(validation_data["pil_images"], validation_data["prompts"])):
+        
+        with torch.no_grad():
+            with autocast_ctx:
+                # Generate with IP adapter
+                image = pipeline(
+                    width=config.dataset.image_size,
+                    height=config.dataset.image_size,
+                    prompt=prompt,
+                    negative_prompt="",
+                    true_cfg_scale=config.train.guidance_scale,
+                    generator=generator,
+                    ip_adapter_image=pil_img,
+                ).images[0]
+                
+                # Generate without IP adapter for comparison
+                image_no_ip = pipeline(
+                    width=config.dataset.image_size,
+                    height=config.dataset.image_size,
+                    prompt=prompt,
+                    negative_prompt="",
+                    true_cfg_scale=config.train.guidance_scale,
+                    generator=generator,
+                ).images[0]
+        
+        all_images.append(image)
+        
+        # Compute CLIP image-to-image similarity using torchmetrics
+        with torch.no_grad():
+            # pipeline's image_encoder + cosine similarity
+            gen_inputs = pipeline.feature_extractor(images=image, return_tensors="pt").pixel_values.to(accelerator.device, dtype=weight_dtype)
+            target_inputs = pipeline.feature_extractor(images=pil_img, return_tensors="pt").pixel_values.to(accelerator.device, dtype=weight_dtype)
+            
+            gen_embed = pipeline.image_encoder(gen_inputs).image_embeds
+            target_embed = pipeline.image_encoder(target_inputs).image_embeds
+            gen_embed = gen_embed / gen_embed.norm(dim=-1, keepdim=True)
+            target_embed = target_embed / target_embed.norm(dim=-1, keepdim=True)
+            
+            clip_sim_pipeline = F.cosine_similarity(gen_embed, target_embed).item() * 100
+            
+            # Log comparison for debugging
+            logger.info(f"CLIP sim (pipeline): {clip_sim_pipeline:.4f}")
+        
+        # Log to wandb
+        for tracker in accelerator.trackers:
+            if tracker.name == "wandb":
+                log_dict = {
+                    f"validation_{i}": wandb.Image(image, caption=prompt),
+                    f"validation_{i}_no_ip": wandb.Image(image_no_ip, caption=f"{prompt} (no IP)"),
+                    f"condition_{i}": wandb.Image(pil_img, caption="Condition"),
+                    f"clip_sim_pipeline_val_{i}": clip_sim_pipeline,
+                }
+                if global_step is not None:
+                    tracker.log(log_dict, step=global_step)
+                else:
+                    tracker.log(log_dict)
+    
+    return all_images
+
 def log_test_sample(pipeline, 
                     test_sample, 
                     accelerator, 
                     weight_dtype,
                     config,
-                    is_final_validation=False):
+                    global_step=None,
+                    ):
     
     logger.info("Running test sample...")
     pipeline.set_progress_bar_config(disable=True)
     
     # run inference
     generator = torch.Generator(device=accelerator.device).manual_seed(config.test.seed) if config.test.seed is not None else None
-    autocast_ctx = torch.autocast(accelerator.device.type, weight_dtype) if not is_final_validation else nullcontext()
+    autocast_ctx = torch.autocast(accelerator.device.type, weight_dtype) 
     
     with torch.no_grad():
         with autocast_ctx:
@@ -451,22 +535,23 @@ def log_test_sample(pipeline,
         logger.info(f"CLIP sim (pipeline): {clip_sim_pipeline:.4f}")
         
     for tracker in accelerator.trackers:
-        phase_name = "test" if is_final_validation else "validation"
         if tracker.name == "tensorboard":
             np_images = np.stack([np.asarray(img) for img in images])
             tracker.writer.add_images(phase_name, np_images, epoch, dataformats="NHWC")
         if tracker.name == "wandb":
-            tracker.log(
-                {
-                    phase_name: [
-                        wandb.Image(image, caption=f"{test_sample['prompts']}") 
-                    ],
-                    'test_no_ip': [wandb.Image(image_no_ip, caption=f"{test_sample['prompts']}")],
-                    'condition_image': [wandb.Image(test_sample["pil_condition_images"][0], caption="Conditioning")],
-                    'target_image': [wandb.Image(test_sample["pil_target_images"][0], caption="Target")],
-                    'clip_sim_pipeline': clip_sim_pipeline,
-                }
-            )
+            log_dict = {
+                "validation": [
+                    wandb.Image(image, caption=f"{test_sample['prompts']}") 
+                ],
+                'test_no_ip': [wandb.Image(image_no_ip, caption=f"{test_sample['prompts']}")],
+                'condition_image': [wandb.Image(test_sample["pil_condition_images"][0], caption="Conditioning")],
+                'target_image': [wandb.Image(test_sample["pil_target_images"][0], caption="Target")],
+                'clip_sim_pipeline': clip_sim_pipeline,
+            }
+            if global_step is not None:
+                tracker.log(log_dict, step=global_step)
+            else:
+                tracker.log(log_dict)
     return image
 
 def main():
@@ -666,7 +751,7 @@ def main():
     logger.info(f"  Gradient Accumulation steps = {config.train.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {config.train.max_train_steps}")
     global_step = 0
-    first_epoch = 0
+    # first_epoch = 0
     
     if config.resume_from_checkpoint:
         if config.resume_path is not None:
@@ -674,7 +759,7 @@ def main():
             accelerator.load_state(config.resume_path)
             global_step = int(os.path.basename(config.resume_path).split("-")[1])
             initial_global_step = global_step
-            first_epoch = global_step // num_update_steps_per_epoch
+            # first_epoch = global_step // num_update_steps_per_epoch
         else:
             # TODO: implement resume from latest checkpoint by default
             raise ValueError("Resume path is not set.")
@@ -699,6 +784,29 @@ def main():
         while len(sigma.shape) < n_dim:
             sigma = sigma.unsqueeze(-1)
         return sigma
+    
+    # Pre-load validation images once (avoids reloading each validation step)
+    validation_data = None
+    if hasattr(config, 'validations') and config.validations is not None:
+        validation_images_pil = []
+        validation_clip_images = []
+        
+        # Transform: resize shortest edge to target, then center crop
+        val_transform = T.Compose([
+            T.Resize(config.dataset.image_size, interpolation=T.InterpolationMode.BICUBIC),
+            T.CenterCrop(config.dataset.image_size),
+        ])
+        
+        for img_path in config.validations.images:
+            pil_img = Image.open(img_path).convert("RGB")
+            pil_img = val_transform(pil_img)  # Resize + center crop (no distortion)
+            validation_images_pil.append(pil_img)
+        
+        validation_data = {
+            "pil_images": validation_images_pil,
+            "prompts": config.validations.prompts,
+        }
+        logger.info(f"Pre-loaded {len(validation_images_pil)} validation images")
     
     # Training Loop
     # for epoch in range(first_epoch, config.train.num_train_epochs):
@@ -804,6 +912,37 @@ def main():
                 loss = loss.mean()
                 
                 accelerator.backward(loss)
+                
+                # Log gradient stats for debugging IP adapter modules
+                if accelerator.sync_gradients and global_step % 1 == 0 and accelerator.is_main_process:
+                    grad_stats = {}
+                    
+                    # Image projection gradients
+                    for name, param in transformer.encoder_hid_proj.named_parameters():
+                        if param.grad is not None:
+                            grad_stats[f"grad/proj_{name}_norm"] = param.grad.norm().item()
+                            grad_stats[f"grad/proj_{name}_mean"] = param.grad.mean().item()
+                            grad_stats[f"grad/proj_{name}_max"] = param.grad.abs().max().item()
+                    
+                    # Attention processor gradients (per layer, separate weight/bias)
+                    for proc_name, proc in transformer.attn_processors.items():
+                        # Extract layer index from name (e.g., "transformer_blocks.5.attn.processor" -> "block_5")
+                        layer_key = proc_name.replace(".", "_").replace("attn_processor", "").strip("_")
+                        
+                        if hasattr(proc, 'to_k_ip'):
+                            for name, p in proc.to_k_ip.named_parameters():
+                                if p.grad is not None:
+                                    param_type = "weight" if "weight" in name else "bias"
+                                    grad_stats[f"grad/{layer_key}_to_k_ip_{param_type}_norm"] = p.grad.norm().item()
+                        
+                        if hasattr(proc, 'to_v_ip'):
+                            for name, p in proc.to_v_ip.named_parameters():
+                                if p.grad is not None:
+                                    param_type = "weight" if "weight" in name else "bias"
+                                    grad_stats[f"grad/{layer_key}_to_v_ip_{param_type}_norm"] = p.grad.norm().item()
+                    
+                    accelerator.log(grad_stats, step=global_step)
+                
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(ip_adapter_trainable_params, config.train.optimizer.max_grad_norm)
                 optimizer.step()
@@ -844,7 +983,7 @@ def main():
             if global_step >= config.train.max_train_steps:
                 break 
             
-            # Generate test samples every N steps
+            # Generate test samples every N steps from the test dataloader
             if global_step % config.logging.test_steps == 0:
                 # Sync all GPUs before test generation to prevent OOM
                 accelerator.wait_for_everyone()
@@ -859,7 +998,8 @@ def main():
                                     accelerator=accelerator,
                                     weight_dtype=weight_dtype,
                                     config=config,
-                                    is_final_validation=False)
+                                    global_step=global_step,
+                                    )
                     # Restore the wrapped transformer for training
                     flux_pipeline.transformer = transformer
                     transformer.train()
@@ -867,6 +1007,24 @@ def main():
                     torch.cuda.empty_cache()
                 # Sync again before resuming training
                 accelerator.wait_for_everyone()
-                      
+                
+            # Generate validation samples 
+            if global_step % config.logging.validation_steps == 0:
+                accelerator.wait_for_everyone()
+                if accelerator.is_main_process:
+                    transformer.eval()
+                    flux_pipeline.transformer = accelerator.unwrap_model(transformer)
+                    log_validation_samples(pipeline=flux_pipeline,
+                                           validation_data=validation_data,
+                                           accelerator=accelerator,
+                                           weight_dtype=weight_dtype,
+                                           config=config,
+                                           global_step=global_step,)
+                    flux_pipeline.transformer = transformer
+                    transformer.train()
+                    # Clear cache to prevent OOM
+                    torch.cuda.empty_cache()
+                # Sync again before resuming training
+                accelerator.wait_for_everyone()
 if __name__ == "__main__":
     main()
