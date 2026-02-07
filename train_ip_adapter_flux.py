@@ -568,6 +568,7 @@ def main():
         os.makedirs(config.logging.output_dir, exist_ok=True)
     logging_dir = Path(config.logging.output_dir, config.logging.logging_dir)
     accelerator = Accelerator(
+        gradient_accumulation_steps=config.train.gradient_accumulation_steps,
         mixed_precision=config.dtype,
         log_with=config.logging.logger,
         project_config=ProjectConfiguration(project_dir=config.logging.output_dir, logging_dir=logging_dir),
@@ -581,8 +582,10 @@ def main():
     weight_dtype = DTYPE_MAP[config.dtype]
     flux_pipeline = FluxPipeline.from_pretrained(config.flux_path, torch_dtype=weight_dtype).to('cuda')
     # Freeze the Flux pipeline
-    flux_pipeline.text_encoder.to(accelerator.device, dtype=weight_dtype).requires_grad_(False)
-    flux_pipeline.text_encoder_2.to(accelerator.device, dtype=weight_dtype).requires_grad_(False)
+    # flux_pipeline.text_encoder.to(accelerator.device, dtype=weight_dtype).requires_grad_(False)
+    # flux_pipeline.text_encoder_2.to(accelerator.device, dtype=weight_dtype).requires_grad_(False)
+    flux_pipeline.text_encoder.to('cpu', dtype=weight_dtype).requires_grad_(False)
+    flux_pipeline.text_encoder_2.to('cpu', dtype=weight_dtype).requires_grad_(False)
     flux_pipeline.vae.to(accelerator.device, dtype=weight_dtype).requires_grad_(False)
     flux_pipeline.transformer.to(accelerator.device, dtype=weight_dtype).requires_grad_(False)
     noise_scheduler_copy = copy.deepcopy(flux_pipeline.scheduler)
@@ -658,13 +661,23 @@ def main():
     text_encoders = [flux_pipeline.text_encoder, flux_pipeline.text_encoder_2]
     def compute_text_embeddings(prompt, text_encoders, tokenizers):
         with torch.no_grad():
+            # Manual text encoder cpu offloading to save VRAM
+            # Move text encoders back to gpu
+            text_encoders[0].to(accelerator.device, dtype=weight_dtype)
+            text_encoders[1].to(accelerator.device, dtype=weight_dtype)
             prompt_embeds, pooled_prompt_embeds, text_ids = encode_prompt(
                 text_encoders, tokenizers, prompt, config.train.text_encoder.max_sequence_length
             )
+            # Move text encoders back to cpu
+            text_encoders[0].to('cpu', dtype=weight_dtype)
+            text_encoders[1].to('cpu', dtype=weight_dtype)
+            torch.cuda.empty_cache()
             prompt_embeds = prompt_embeds.to(accelerator.device)
             pooled_prompt_embeds = pooled_prompt_embeds.to(accelerator.device)
             text_ids = text_ids.to(accelerator.device)
+        
         return prompt_embeds, pooled_prompt_embeds, text_ids
+    
     vae_config_shift_factor = flux_pipeline.vae.config.shift_factor
     vae_config_scaling_factor = flux_pipeline.vae.config.scaling_factor
     vae_config_block_out_channels = flux_pipeline.vae.config.block_out_channels
@@ -918,14 +931,14 @@ def main():
                     grad_stats = {}
                     
                     # Image projection gradients
-                    for name, param in transformer.encoder_hid_proj.named_parameters():
+                    for name, param in accelerator.unwrap_model(transformer).encoder_hid_proj.named_parameters():
                         if param.grad is not None:
                             grad_stats[f"grad/proj_{name}_norm"] = param.grad.norm().item()
                             grad_stats[f"grad/proj_{name}_mean"] = param.grad.mean().item()
                             grad_stats[f"grad/proj_{name}_max"] = param.grad.abs().max().item()
                     
                     # Attention processor gradients (per layer, separate weight/bias)
-                    for proc_name, proc in transformer.attn_processors.items():
+                    for proc_name, proc in accelerator.unwrap_model(transformer).attn_processors.items():
                         # Extract layer index from name (e.g., "transformer_blocks.5.attn.processor" -> "block_5")
                         layer_key = proc_name.replace(".", "_").replace("attn_processor", "").strip("_")
                         

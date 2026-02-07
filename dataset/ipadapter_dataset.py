@@ -77,8 +77,9 @@ def build_laion2B_dataloader(shard_pattern, feature_extractor, config, split='tr
         dataset.batched(config.train.batch_size if split == 'train' else 1, partial=not config.dataset.drop_last),
         batch_size=None,  # IMPORTANT: dataset already batched
         num_workers=config.dataset.train_dataloader_num_workers if split == 'train' else config.dataset.test_dataloader_num_workers,
+        prefetch_factor=config.dataset.train_prefetch_factor if split == 'train' else config.dataset.test_prefetch_factor,
         pin_memory=True,
-        persistent_workers=False,  # Disabled to prevent memory leak with WebDataset
+        persistent_workers=False,  # Disabled to prevent OOM
         collate_fn=collate_fn,
     )
     return loader
@@ -159,6 +160,7 @@ def build_subject200k_dataloader(data, feature_extractor, config, split='train')
         drop_text_prob=config.dataset.drop_text_prob if split == 'train' else 0.0,
         drop_image_prob=config.dataset.drop_image_prob if split == 'train' else 0.0,
         clip_image_processor=feature_extractor,
+        return_pil_image=(split != 'train'),
     )
         
     dataloader = torch.utils.data.DataLoader(
@@ -167,6 +169,7 @@ def build_subject200k_dataloader(data, feature_extractor, config, split='train')
         collate_fn=collate_fn,
         batch_size=config.train.batch_size if split == 'train' else 1,
         num_workers=config.dataset.train_dataloader_num_workers if split == 'train' else config.dataset.test_dataloader_num_workers,
+        
     ) #[N, C, H, W]
     
     return dataloader
