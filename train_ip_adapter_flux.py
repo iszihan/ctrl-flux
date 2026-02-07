@@ -582,18 +582,23 @@ def main():
     weight_dtype = DTYPE_MAP[config.dtype]
     flux_pipeline = FluxPipeline.from_pretrained(config.flux_path, torch_dtype=weight_dtype).to('cuda')
     # Freeze the Flux pipeline
-    # flux_pipeline.text_encoder.to(accelerator.device, dtype=weight_dtype).requires_grad_(False)
-    # flux_pipeline.text_encoder_2.to(accelerator.device, dtype=weight_dtype).requires_grad_(False)
-    flux_pipeline.text_encoder.to('cpu', dtype=weight_dtype).requires_grad_(False)
-    flux_pipeline.text_encoder_2.to('cpu', dtype=weight_dtype).requires_grad_(False)
+    if config.train.text_encoder_offload:
+        flux_pipeline.text_encoder.to('cpu', dtype=weight_dtype).requires_grad_(False)
+        flux_pipeline.text_encoder_2.to('cpu', dtype=weight_dtype).requires_grad_(False)
+    else:
+        flux_pipeline.text_encoder.to(accelerator.device, dtype=weight_dtype).requires_grad_(False)
+        flux_pipeline.text_encoder_2.to(accelerator.device, dtype=weight_dtype).requires_grad_(False)
     flux_pipeline.vae.to(accelerator.device, dtype=weight_dtype).requires_grad_(False)
     flux_pipeline.transformer.to(accelerator.device, dtype=weight_dtype).requires_grad_(False)
     noise_scheduler_copy = copy.deepcopy(flux_pipeline.scheduler)
     
     # Setup the IP Adapter modules
     ip_adapter_trainable_params = setup_ip_adapter(flux_pipeline, image_encoder_pretrained_model_name_or_path=config.image_encoder_path)
+    # Ensure image_encoder is on the same device as inputs (setup_ip_adapter may have put it on pipeline.device == CPU)
+    flux_pipeline.image_encoder.to(accelerator.device, dtype=weight_dtype).requires_grad_(False)
     total_number_of_trainable_params = sum(p.numel() for p in ip_adapter_trainable_params)
     params_to_optimize = [{'params': ip_adapter_trainable_params, 'lr': config.train.optimizer.lr}]
+    
     
     if config.gradient_checkpointing:
         flux_pipeline.transformer.enable_gradient_checkpointing()
@@ -661,17 +666,19 @@ def main():
     text_encoders = [flux_pipeline.text_encoder, flux_pipeline.text_encoder_2]
     def compute_text_embeddings(prompt, text_encoders, tokenizers):
         with torch.no_grad():
-            # Manual text encoder cpu offloading to save VRAM
-            # Move text encoders back to gpu
-            text_encoders[0].to(accelerator.device, dtype=weight_dtype)
-            text_encoders[1].to(accelerator.device, dtype=weight_dtype)
+            if config.train.text_encoder_offload:
+                # Manual text encoder cpu offloading to save VRAM
+                # Move text encoders back to gpu
+                text_encoders[0].to(accelerator.device, dtype=weight_dtype)
+                text_encoders[1].to(accelerator.device, dtype=weight_dtype)
             prompt_embeds, pooled_prompt_embeds, text_ids = encode_prompt(
                 text_encoders, tokenizers, prompt, config.train.text_encoder.max_sequence_length
             )
-            # Move text encoders back to cpu
-            text_encoders[0].to('cpu', dtype=weight_dtype)
-            text_encoders[1].to('cpu', dtype=weight_dtype)
-            torch.cuda.empty_cache()
+            if config.train.text_encoder_offload:
+                # Move text encoders back to cpu
+                text_encoders[0].to('cpu', dtype=weight_dtype)
+                text_encoders[1].to('cpu', dtype=weight_dtype)
+                torch.cuda.empty_cache()
             prompt_embeds = prompt_embeds.to(accelerator.device)
             pooled_prompt_embeds = pooled_prompt_embeds.to(accelerator.device)
             text_ids = text_ids.to(accelerator.device)
@@ -772,7 +779,16 @@ def main():
             accelerator.load_state(config.resume_path)
             global_step = int(os.path.basename(config.resume_path).split("-")[1])
             initial_global_step = global_step
-            # first_epoch = global_step // num_update_steps_per_epoch
+            # Override LR with current config (checkpoint stores previous run's lr, e.g. 1e-4)
+            new_lr = config.train.optimizer.lr
+            for pg in optimizer.param_groups:
+                pg["lr"] = new_lr
+            # Update scheduler so get_last_lr() and next step() use new lr
+            target = getattr(lr_scheduler, "scheduler", lr_scheduler)  # unwrap Accelerator wrapper if present
+            if getattr(target, "base_lrs", None) is not None:
+                target.base_lrs = [new_lr] * len(optimizer.param_groups)
+            if getattr(target, "_last_lr", None) is not None:
+                target._last_lr = [new_lr] * len(optimizer.param_groups)
         else:
             # TODO: implement resume from latest checkpoint by default
             raise ValueError("Resume path is not set.")
@@ -838,6 +854,7 @@ def main():
                 # Compute ID-Adapter image embeddings 
                 condition_clip = batch["clip_images"].to(device=accelerator.device, dtype=weight_dtype)
                 image_embeds = flux_pipeline.encode_image(condition_clip, accelerator.device, 1) # [B, 768]
+                
                 joint_attention_kwargs = {"ip_adapter_image_embeds": image_embeds}
                 
                 # Convert images to latent space
