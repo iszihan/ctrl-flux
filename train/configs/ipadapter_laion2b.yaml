@@ -34,8 +34,9 @@ dataset:
 train:
   num_train_epochs: 4
   max_train_steps: 1000000  # Required for WebDataset (no len())
-  batch_size: 8
+  batch_size: 4
   gradient_accumulation_steps: 1
+  text_encoder_offload: false
   guidance_scale: 3.5
   optimizer: 
     type: 'adamw'

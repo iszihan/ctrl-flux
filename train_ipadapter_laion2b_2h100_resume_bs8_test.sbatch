@@ -1,12 +1,4 @@
 #!/bin/bash
-#SBATCH --job-name=ipflux4_laion2b_resume_nonzeroinit            # change if needed
-#SBATCH --gres=gpu:l40s:4
-#SBATCH --cpus-per-task=32  # 4 GPUs × 4 workers = 16 workers + overhead
-#SBATCH --mem=48G  # increased from 48G to prevent CPU OOM
-#SBATCH --time=48:00:00
-#SBATCH --output=/project/aip-jacobson/zling/ctrl-flux/logs/%x_%j.out
-#SBATCH --error=/project/aip-jacobson/zling/ctrl-flux/logs/%x_%j.err
-#SBATCH --chdir=/project/aip-jacobson/zling/ctrl-flux
 
 echo "Job started on $(hostname)"
 echo "PWD: $(pwd)"
@@ -27,12 +19,21 @@ MONITOR_PID=$!
 source ~/.bashrc
 source venv/bin/activate
 
-export CONFIG_PATH=./train/configs/ipadapter_laion2b_resume.yaml
+export CONFIG_PATH=./train/configs/ipadapter_laion2b.yaml
 
+# Increase batch size from 4 to 8 
+# Increase learning rate from 1e-4 to 2e-4 to account for double effective batch size 
+# Dataloader num workers and prefetch factor stay the same for now.
 accelerate launch \
     --num_processes 4 \
     --main_process_port 41353 \
-    -m train_ip_adapter_flux expname=ipflux-laion2b-4l40s-nonzeroinit
+    train_ip_adapter_flux.py \
+    expname=ipflux-laion2b-4h100-nonzeroinit-b8-lr2e-4 \
+    resume_from_checkpoint=true \
+    resume_path=runs/ipflux-laion2b-4l40s-nonzeroinit/ip_adapter-040000 \
+    train.batch_size=8 \
+    dataset.train_prefetch_factor=2 \
+    train.optimizer.lr=2e-4
 
 # Cleanup: kill memory monitor
 kill $MONITOR_PID 2>/dev/null
