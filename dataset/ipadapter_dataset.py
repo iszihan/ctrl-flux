@@ -11,6 +11,7 @@ from torchvision import transforms
 from braceexpand import braceexpand
 import webdataset as wds
 import torch
+import numpy as np
 from .util import _pil_to_rgb, _tensor_to_pil
 
 def build_laion2B_dataloader(shard_pattern, feature_extractor, config, split='train', rank=0, world_size=1):
@@ -131,24 +132,28 @@ def build_laion2B_local_dataloader(data_dir, feature_extractor, config, split='t
 def build_subject200k_dataloader(data, feature_extractor, config, split='train'):
     
     def collate_fn(data):
+        
         images = torch.stack([example["image"] for example in data])
-        clip_images = torch.cat([example["condition_clip"] for example in data], dim=0)
+        condition_images = torch.stack([example["condition_image"] for example in data])
+        position_delta = torch.cat([example["position_delta"] for example in data])
         prompts = [example["prompt"] for example in data]
+        results = {
+            "images": images,
+            "condition_images": condition_images,
+            "prompts": prompts,
+            "position_delta": position_delta,
+        }
+        if "condition_clip" in data[0]:
+            clip_images = torch.cat([example["condition_clip"] for example in data], dim=0)
+            results["clip_images"] = clip_images
+            
         if 'pil_target_image' in data[0]:
             target_images = [example["pil_target_image"] for example in data]
             condition_images = [example["pil_condition_image"] for example in data]
-            return {
-                "images": images,
-                "clip_images": clip_images,
-                "prompts": prompts,
-                "pil_target_images": target_images,
-                "pil_condition_images": condition_images,
-            }
-        return {
-            "images": images,
-            "clip_images": clip_images,
-            "prompts": prompts,
-        }
+            results["pil_target_images"] = target_images
+            results["pil_condition_images"] = condition_images
+            return results
+        return results
     
     dataset = Subject200KDataset(
         data,
@@ -165,7 +170,7 @@ def build_subject200k_dataloader(data, feature_extractor, config, split='train')
         
     dataloader = torch.utils.data.DataLoader(
         dataset,
-        shuffle=True if split == 'train' else False,
+        shuffle=False, #for debugging only #True if split == 'train' else False,
         collate_fn=collate_fn,
         batch_size=config.train.batch_size if split == 'train' else 1,
         num_workers=config.dataset.train_dataloader_num_workers if split == 'train' else config.dataset.test_dataloader_num_workers,
@@ -232,10 +237,12 @@ class Subject200KDataset(Dataset):
         target_image, condition_img = (
             (left_img, right_img) if target == 0 else (right_img, left_img)
         )
-        condition_img_clip = self.clip_image_processor(images=condition_img, return_tensors="pt").pixel_values
+        if self.clip_image_processor is not None:
+            condition_img_clip = self.clip_image_processor(images=condition_img, return_tensors="pt").pixel_values
 
         # Resize the image
         target_image = target_image.resize(self.target_size).convert("RGB")
+        condition_img = condition_img.resize(self.condition_size).convert("RGB")
 
         # Get the description
         description = item["description"][
@@ -249,16 +256,21 @@ class Subject200KDataset(Dataset):
             description = ""
         if drop_image:
             condition_img = Image.new("RGB", self.condition_size, (0, 0, 0))
-            condition_img_clip = self.clip_image_processor(images=condition_img, return_tensors="pt").pixel_values
-        
-        return {
+            if self.clip_image_processor is not None:
+                condition_img_clip = self.clip_image_processor(images=condition_img, return_tensors="pt").pixel_values
+        position_delta = np.array([[0, -self.condition_size[0] // 16]])
+        outputs = {
             "image": self.to_tensor(target_image),
-            "condition_clip": condition_img_clip,
+            "condition_image": self.to_tensor(condition_img),
             "condition_type": self.condition_type,
             "prompt": description,
+            "position_delta": self.to_tensor(position_delta),
             **({"pil_target_image": target_image,
                 'pil_condition_image': condition_img} if self.return_pil_image else {}),
         }
+        if self.clip_image_processor is not None:
+            outputs["condition_clip"] = condition_img_clip
+        return outputs
 
 class Laion2BLocalDataset(Dataset):
     """
