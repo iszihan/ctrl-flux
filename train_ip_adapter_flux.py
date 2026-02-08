@@ -25,7 +25,7 @@ import random
 import numpy as np
 from PIL import Image
 import wandb
-from dataset.ipadapter_dataset import build_subject200k_dataloader, build_laion2B_dataloader, build_laion2B_local_dataloader
+from dataset.dataset_utils import build_subject200k_dataloader, build_laion2B_dataloader
 
 DTYPE_MAP = {
     "bf16": torch.bfloat16,
@@ -646,20 +646,7 @@ def main():
             split='test',
             rank=0,  # no sharding for test
             world_size=1
-        )
-    elif config.dataset.type == 'laion2b_local':
-        train_dataloader = build_laion2B_local_dataloader(
-            config.dataset.train_data_dir,
-            flux_pipeline.feature_extractor,
-            config,
-            split='train'
-        )
-        test_dataloader = build_laion2B_local_dataloader(
-            config.dataset.test_data_dir,
-            flux_pipeline.feature_extractor,
-            config,
-            split='test'
-        )                                                                          
+        )                                                                        
     test_iter = iter(test_dataloader)
     
     tokenizers = [flux_pipeline.tokenizer, flux_pipeline.tokenizer_2]
@@ -739,7 +726,7 @@ def main():
     # reassign the wrapped transformer to the flux pipeline
     flux_pipeline.transformer = transformer
     
-    if config.dataset.type in ['subject', 'laion2b_local']:
+    if config.dataset.type in ['subject']:
         # We need to recalculate our total training steps as the size of the training dataloader may have changed.
         num_update_steps_per_epoch = math.ceil(len(train_dataloader) / config.train.gradient_accumulation_steps)
         if 'max_train_steps' not in config.train:

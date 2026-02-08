@@ -33,7 +33,7 @@ import numpy as np
 from PIL import Image
 import wandb
 from arrgh import arrgh
-from dataset.ipadapter_dataset import build_subject200k_dataloader, build_laion2B_dataloader, build_laion2B_local_dataloader
+from dataset.dataset_utils import build_subject200k_dataloader, build_laion2B_dataloader
 from peft import LoraConfig, set_peft_model_state_dict
 from peft.utils import get_peft_model_state_dict
 from diffusers.utils import convert_unet_state_dict_to_peft
