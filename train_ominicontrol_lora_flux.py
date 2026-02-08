@@ -18,6 +18,10 @@ from diffusers.models.transformers.transformer_flux import FluxIPAdapterAttnProc
 from diffusers.optimization import get_scheduler
 from diffusers.pipelines import FluxPipeline
 from diffusers.training_utils import compute_density_for_timestep_sampling, compute_loss_weighting_for_sd3
+from diffusers.utils.torch_utils import is_compiled_module
+from diffusers.training_utils import (
+    _collate_lora_metadata
+)
 from transformers import CLIPVisionModelWithProjection, CLIPImageProcessor
 from datasets import load_dataset
 from ipadapters.ipadapter import setup_ip_adapter
@@ -30,7 +34,9 @@ from PIL import Image
 import wandb
 from arrgh import arrgh
 from dataset.ipadapter_dataset import build_subject200k_dataloader, build_laion2B_dataloader, build_laion2B_local_dataloader
-from peft import LoraConfig
+from peft import LoraConfig, set_peft_model_state_dict
+from peft.utils import get_peft_model_state_dict
+from diffusers.utils import convert_unet_state_dict_to_peft
 from ominilora.transformer_flux_omini import omini_transformer_forward
 DTYPE_MAP = {
     "bf16": torch.bfloat16,
@@ -225,10 +231,66 @@ def main():
     noise_scheduler_copy = copy.deepcopy(flux_pipeline.scheduler)
     
     # Setup the LoRAs (Single Condition only for now)
-    adapters = [None,None,config.train.lora.name]
-    lora_layers = init_loras([adapters[-1]], flux_pipeline, config.train.lora.config)
+    adapters = [None, None, config.train.lora.name]
+    adapter_name = adapters[-1]  # trainable adapter name for save/load
+    lora_layers = init_loras([adapter_name], flux_pipeline, config.train.lora.config)
     params_to_optimize = lora_layers
     total_number_of_trainable_params = sum(p.numel() for p in params_to_optimize)
+
+    def unwrap_model(model):
+        model = accelerator.unwrap_model(model)
+        model = model._orig_mod if is_compiled_module(model) else model
+        return model
+
+    def save_model_hook(models, weights, output_dir):
+        if accelerator.is_main_process:
+            transformer_lora_layers_to_save = None
+            modules_to_save = {}
+            for model in models:
+                if isinstance(model, type(unwrap_model(transformer))):
+                    # state dict for this adapter only (correct keys for loading with adapter_name)
+                    transformer_lora_layers_to_save = get_peft_model_state_dict(model, adapter_name=adapter_name)
+                    modules_to_save["transformer"] = model
+                else:
+                    raise ValueError(f"unexpected save model: {model.__class__}")
+
+                # make sure to pop weight so that corresponding model is not saved again
+                weights.pop()
+
+            FluxPipeline.save_lora_weights(
+                output_dir,
+                weight_name=f"{adapter_name}.safetensors",
+                transformer_lora_layers=transformer_lora_layers_to_save,
+                safe_serialization=True
+            )
+    def load_model_hook(models, input_dir):
+        # Same pattern as diffusers train_dreambooth_lora_flux.py, but with adapter_name and weight_name.
+        # We only have transformer (no text encoder LoRA in Omini).
+        transformer_ = None
+        while len(models) > 0:
+            model = models.pop()
+            if isinstance(model, type(unwrap_model(transformer))):
+                transformer_ = model
+            else:
+                raise ValueError(f"unexpected load model: {model.__class__}")
+
+        if transformer_ is None or not accelerator.is_main_process:
+            return
+
+        # Load from the file we saved (adapter-named file)
+        lora_state_dict = FluxPipeline.lora_state_dict(input_dir, weight_name=f"{adapter_name}.safetensors")
+        transformer_state_dict = {
+            f"{k.replace('transformer.', '')}": v for k, v in lora_state_dict.items() if k.startswith("transformer.")
+        }
+        transformer_state_dict = convert_unet_state_dict_to_peft(transformer_state_dict)
+        incompatible_keys = set_peft_model_state_dict(transformer_, transformer_state_dict, adapter_name=adapter_name)
+        if incompatible_keys is not None:
+            unexpected_keys = getattr(incompatible_keys, "unexpected_keys", None)
+            if unexpected_keys:
+                logger.warning(
+                    f"Loading adapter weights from state_dict led to unexpected keys not found in the model: {unexpected_keys}"
+                )
+        logger.info(f"Loaded LoRA weights from {input_dir} (adapter_name={adapter_name})")
     
     if config.gradient_checkpointing:
         flux_pipeline.transformer.enable_gradient_checkpointing()
@@ -297,11 +359,8 @@ def main():
         **config.train.optimizer.params,
     )
     
-    # TODO
-    # save_model_hook, load_model_hook = create_ip_adapter_hooks(accelerator, flux_pipeline.transformer)
-    # accelerator.register_save_state_pre_hook(save_model_hook)
-    # accelerator.register_load_state_pre_hook(load_model_hook)
-    
+    accelerator.register_save_state_pre_hook(save_model_hook)
+    accelerator.register_load_state_pre_hook(load_model_hook)
     
     transformer, optimizer, train_dataloader = accelerator.prepare(
         flux_pipeline.transformer, optimizer, train_dataloader
@@ -519,7 +578,7 @@ def main():
                     if global_step % config.logging.checkpointing_steps == 0:
                         if config.logging.checkpoints_total_limit > 0:
                             checkpoints = os.listdir(config.logging.output_dir)
-                            checkpoints = [d for d in checkpoints if os.path.isdir(d) and d.starts("ip_adapter-")]
+                            checkpoints = [d for d in checkpoints if os.path.isdir(d) and d.starts("ominilora-")]
                             checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
                             
                             # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
@@ -533,10 +592,10 @@ def main():
                                 logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
 
                                 for removing_checkpoint in removing_checkpoints:
-                                    removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
+                                    removing_checkpoint = os.path.join(config.logging.output_dir, removing_checkpoint)
                                     shutil.rmtree(removing_checkpoint)
-                        accelerator.save_state(f"{config.logging.output_dir}/ip_adapter-{global_step:06d}", safe_serialization=True)
-                        logger.info(f"Saved state to {config.logging.output_dir}/ip_adapter-{global_step:06d}.safetensors")
+                        accelerator.save_state(f"{config.logging.output_dir}/ominilora-{global_step:06d}", safe_serialization=True)
+                        logger.info(f"Saved state to {config.logging.output_dir}/ominilora-{global_step:06d}.safetensors")
                         
             logs = {"loss": loss.detach().item(), 
                     "lr": optimizer.param_groups[0]["lr"]}
