@@ -14,7 +14,7 @@ from pathlib import Path
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration
-from diffusers.models.transformers.transformer_flux import FluxIPAdapterAttnProcessor              
+from diffusers.models.transformers.transformer_flux import FluxTransformer2DModel, FluxIPAdapterAttnProcessor              
 from diffusers.optimization import get_scheduler
 from diffusers.pipelines import FluxPipeline
 from diffusers.training_utils import compute_density_for_timestep_sampling, compute_loss_weighting_for_sd3
@@ -22,7 +22,19 @@ from diffusers.utils.torch_utils import is_compiled_module
 from diffusers.training_utils import (
     _collate_lora_metadata
 )
-from transformers import CLIPVisionModelWithProjection, CLIPImageProcessor
+from diffusers import (
+    AutoencoderKL,
+    FlowMatchEulerDiscreteScheduler,
+)
+from transformers import (
+    CLIPVisionModelWithProjection,
+    CLIPImageProcessor, 
+    CLIPTextModel, 
+    T5EncoderModel,
+    CLIPTokenizer,
+    T5TokenizerFast,
+)
+from diffusers.image_processor import VaeImageProcessor
 from datasets import load_dataset
 from ipadapters.ipadapter import setup_ip_adapter
 from torch.utils.data import Dataset
@@ -36,8 +48,11 @@ from arrgh import arrgh
 from dataset.dataset_utils import build_subject200k_dataloader, build_laion2B_dataloader
 from peft import LoraConfig, set_peft_model_state_dict
 from peft.utils import get_peft_model_state_dict
-from diffusers.utils import convert_unet_state_dict_to_peft
+from diffusers.utils import convert_unet_state_dict_to_peft, _get_model_file, SAFETENSORS_WEIGHTS_NAME, WEIGHTS_NAME
+from diffusers.models.model_loading_utils import load_state_dict as load_diffusers_state_dict
 from ominilora.transformer_flux_omini import omini_transformer_forward
+from ominilora.transformer_flux_omini import FluxOminiTransformer2DModel
+
 DTYPE_MAP = {
     "bf16": torch.bfloat16,
     "bfloat16": torch.bfloat16,
@@ -184,11 +199,11 @@ def encode_prompt(
 
     return prompt_embeds, pooled_prompt_embeds, text_ids
 
-def init_loras(adapters, flux_pipeline, lora_config):
+def init_loras(adapters, transformer, lora_config):
     for adapter in adapters:
-        flux_pipeline.transformer.add_adapter(LoraConfig(**lora_config), adapter_name=adapter)
+        transformer.add_adapter(LoraConfig(**lora_config), adapter_name=adapter)
     lora_layers = filter(
-        lambda p: p.requires_grad, flux_pipeline.transformer.parameters()
+        lambda p: p.requires_grad, transformer.parameters()
     )
     return list(lora_layers)
     
@@ -216,24 +231,64 @@ def main():
         if config.logging.output_dir is not None:
             os.makedirs(config.logging.output_dir, exist_ok=True)
             
-    # Load the Flux model
+    # Load Flux pipeline, then replace transformer with Omini loaded from pretrained (config + weights) so guidance_embeds etc. are correct; strict=False for Omini block structure
     weight_dtype = DTYPE_MAP[config.dtype]
-    flux_pipeline = FluxPipeline.from_pretrained(config.flux_path, torch_dtype=weight_dtype).to('cuda')
-    # Freeze the Flux pipeline
+
+    # Load Omini transformer from pretrained with correct config (guidance_embeds etc.) and strict=False for block mismatch
+    transformer = FluxOminiTransformer2DModel.from_pretrained(
+        config.flux_path,
+        subfolder="transformer",
+        torch_dtype=weight_dtype,
+    )
+    
+    # Load the tokenizers
+    tokenizer_one = CLIPTokenizer.from_pretrained(
+        config.flux_path,
+        subfolder="tokenizer"
+    )
+    tokenizer_two = T5TokenizerFast.from_pretrained(
+        config.flux_path,
+        subfolder="tokenizer_2"
+    )
+
+    # import correct text encoder classes
+    text_encoder = CLIPTextModel.from_pretrained(
+        config.flux_path,
+        subfolder="text_encoder"
+    )
+    text_encoder_two = T5EncoderModel.from_pretrained(
+        config.flux_path,
+        subfolder="text_encoder_2"
+    )
+
+    # Load scheduler and models
+    noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+        config.flux_path, subfolder="scheduler"
+    )
+    noise_scheduler_copy = copy.deepcopy(noise_scheduler)
+    vae = AutoencoderKL.from_pretrained(
+        config.flux_path,
+        subfolder="vae"
+    )
+    image_processor = VaeImageProcessor(vae_scale_factor=2 ** (len(vae.config.block_out_channels) - 1))
+    feature_extractor = CLIPImageProcessor.from_pretrained(
+        "openai/clip-vit-large-patch14"
+    )
+    
     if config.train.text_encoder_offload:
-        flux_pipeline.text_encoder.to('cpu', dtype=weight_dtype).requires_grad_(False)
-        flux_pipeline.text_encoder_2.to('cpu', dtype=weight_dtype).requires_grad_(False)
+        text_encoder = text_encoder.to('cpu', dtype=weight_dtype).requires_grad_(False)
+        text_encoder_two = text_encoder_two.to('cpu', dtype=weight_dtype).requires_grad_(False)
     else:
-        flux_pipeline.text_encoder.to(accelerator.device, dtype=weight_dtype).requires_grad_(False).eval()
-        flux_pipeline.text_encoder_2.to(accelerator.device, dtype=weight_dtype).requires_grad_(False).eval()
-    flux_pipeline.vae.to(accelerator.device, dtype=weight_dtype).requires_grad_(False).eval()
-    flux_pipeline.transformer.to(accelerator.device, dtype=weight_dtype).requires_grad_(False).train() # train mode for drop out and norm layers 
-    noise_scheduler_copy = copy.deepcopy(flux_pipeline.scheduler)
+        text_encoder = text_encoder.to(accelerator.device, dtype=weight_dtype).requires_grad_(False).eval()
+        text_encoder_two = text_encoder_two.to(accelerator.device, dtype=weight_dtype).requires_grad_(False).eval()
+    vae = vae.to(accelerator.device, dtype=weight_dtype).requires_grad_(False).eval()
+    transformer = transformer.to(accelerator.device, dtype=weight_dtype).requires_grad_(False).train() # train mode for drop out and norm layers 
+    noise_scheduler_copy = copy.deepcopy(noise_scheduler)
     
     # Setup the LoRAs (Single Condition only for now)
     adapters = [None, None, config.train.lora.name]
     adapter_name = adapters[-1]  # trainable adapter name for save/load
-    lora_layers = init_loras([adapter_name], flux_pipeline, config.train.lora.config)
+    lora_layers = init_loras([adapter_name], transformer, config.train.lora.config)
     params_to_optimize = lora_layers
     total_number_of_trainable_params = sum(p.numel() for p in params_to_optimize)
 
@@ -293,7 +348,7 @@ def main():
         logger.info(f"Loaded LoRA weights from {input_dir} (adapter_name={adapter_name})")
     
     if config.gradient_checkpointing:
-        flux_pipeline.transformer.enable_gradient_checkpointing()
+        transformer.enable_gradient_checkpointing()
     
     # Dataloader 
     raw_dataset = load_dataset("Yuanshi/Subjects200K")
@@ -313,16 +368,17 @@ def main():
         num_proc=4,
         cache_file_name="./cache/dataset/data_valid.arrow",
     )
+    
     # Split into train/test                                                                           
     split = data_valid.train_test_split(test_size=0.01, seed=42)                                        
     test_data_valid = split["test"] 
     # Build dataloaders
-    train_dataloader = build_subject200k_dataloader(data_valid, flux_pipeline.feature_extractor, config, split='train')
-    test_dataloader = build_subject200k_dataloader(test_data_valid, flux_pipeline.feature_extractor, config, split='test')                                                                                                                                
+    train_dataloader = build_subject200k_dataloader(data_valid, feature_extractor, config, split='train')
+    test_dataloader = build_subject200k_dataloader(test_data_valid, feature_extractor, config, split='test')                                                                                                                                
     test_iter = iter(test_dataloader)
     
-    tokenizers = [flux_pipeline.tokenizer, flux_pipeline.tokenizer_2]
-    text_encoders = [flux_pipeline.text_encoder, flux_pipeline.text_encoder_2]
+    tokenizers = [tokenizer_one, tokenizer_two]
+    text_encoders = [text_encoder, text_encoder_two]
     def compute_text_embeddings(prompt, text_encoders, tokenizers):
         with torch.no_grad():
             if config.train.text_encoder_offload:
@@ -344,10 +400,10 @@ def main():
         
         return prompt_embeds, pooled_prompt_embeds, text_ids
     
-    vae_config_shift_factor = flux_pipeline.vae.config.shift_factor
-    vae_config_scaling_factor = flux_pipeline.vae.config.scaling_factor
-    vae_config_block_out_channels = flux_pipeline.vae.config.block_out_channels
-    guidance_embeds = flux_pipeline.transformer.config.guidance_embeds
+    vae_config_shift_factor = vae.config.shift_factor
+    vae_config_scaling_factor = vae.config.scaling_factor
+    vae_config_block_out_channels = vae.config.block_out_channels
+    guidance_embeds = transformer.config.guidance_embeds
     
     # Initialize optimizer 
     if config.train.optimizer.type == 'adamw':
@@ -363,10 +419,8 @@ def main():
     accelerator.register_load_state_pre_hook(load_model_hook)
     
     transformer, optimizer, train_dataloader = accelerator.prepare(
-        flux_pipeline.transformer, optimizer, train_dataloader
+        transformer, optimizer, train_dataloader
     )
-    # reassign the wrapped transformer to the flux pipeline
-    flux_pipeline.transformer = transformer
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / config.train.gradient_accumulation_steps)
@@ -451,9 +505,9 @@ def main():
                         # TODO: Implement cache latents
                         raise ValueError("Cache latents is not supported yet.")
                     else:
-                        images = batch["images"].to(device=accelerator.device, dtype=flux_pipeline.vae.dtype)
-                        images = flux_pipeline.image_processor.preprocess(images)
-                        model_input = flux_pipeline.vae.encode(images).latent_dist.sample()
+                        images = batch["images"].to(device=accelerator.device, dtype=vae.dtype)
+                        images = image_processor.preprocess(images)
+                        model_input = vae.encode(images).latent_dist.sample()
                     
                     model_input = (model_input - vae_config_shift_factor) * vae_config_scaling_factor
                     model_input = model_input.to(dtype=weight_dtype)
@@ -491,9 +545,9 @@ def main():
                     # Prepare conditions
                     position_delta = batch["position_delta"]
                     position_scale = batch.get("position_scale", [1.0])[0]
-                    condition_images = batch["condition_images"].to(device=accelerator.device, dtype=flux_pipeline.vae.dtype)
-                    condition_model_input = flux_pipeline.image_processor.preprocess(condition_images)
-                    condition_model_input = flux_pipeline.vae.encode(condition_images).latent_dist.sample()
+                    condition_images = batch["condition_images"].to(device=accelerator.device, dtype=vae.dtype)
+                    condition_model_input = image_processor.preprocess(condition_images)
+                    condition_model_input = vae.encode(condition_images).latent_dist.sample()
                     condition_model_input = (condition_model_input - vae_config_shift_factor) * vae_config_scaling_factor
                     condition_model_input = condition_model_input.to(dtype=weight_dtype)
                 
@@ -541,8 +595,7 @@ def main():
                     group_mask[2:, :2] = False
                     
                 # Predict the noise residual
-                model_pred = omini_transformer_forward(
-                    transformer=transformer,
+                model_pred = transformer(
                     hidden_states=[packed_noisy_model_input, *condition_latents],
                     # YiYi notes: divide it by 1000 for now because we scale it by 1000 in the transformer model (we should not keep it but I want to keep the inputs same for the model for testing)
                     timesteps=[t, t] + [torch.zeros_like(t)] * len(condition_latents),
@@ -556,6 +609,7 @@ def main():
                     adapters=adapters,
                     group_mask=group_mask,
                 )[0]
+                
             
                 # Compute loss
                 target = packed_noisy_model_input - packed_model_input

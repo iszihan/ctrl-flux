@@ -1043,5 +1043,6 @@ def main():
                     torch.cuda.empty_cache()
                 # Sync again before resuming training
                 accelerator.wait_for_everyone()
+
 if __name__ == "__main__":
     main()
