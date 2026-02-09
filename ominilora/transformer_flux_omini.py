@@ -15,7 +15,7 @@ from diffusers.models.attention_processor import Attention, F
 from diffusers.models.embeddings import apply_rotary_emb
 from diffusers.models.transformers.transformer_flux import _get_qkv_projections, FluxAttention, FluxAttnProcessor, FluxTransformerBlock, FluxSingleTransformerBlock
 from transformers import pipeline
-
+from diffusers.pipelines.flux.pipeline_flux import FluxPipelineOutput
 from peft.tuners.tuners_utils import BaseTunerLayer
 from accelerate.utils import is_torch_version
 from diffusers.models.attention_dispatch import dispatch_attention_fn
@@ -27,21 +27,6 @@ import cv2
 
 from PIL import Image, ImageFilter
 from torchvision.transforms.functional import to_pil_image
-
-'''
-What I really wanna do is to have a Omini-version of 
-FluxOminiTransformer2DModel, 
-FluxOminiTransformerBlock, 
-FluxOminiSingleTransformerBlock, 
-FluxOminiAttention etc. 
-and re-instantiate the transformer within the pipeline with these modules and run forward.
-
-Ideally, the modules in diffusers should be modified to support Omini-type of lora mechanism.
-
-For now, we will do the easier thing of just overriding the forward method but follow the diffuse style.
-'''
-
-
 
 
 def clip_hidden_states(hidden_states: torch.FloatTensor) -> torch.FloatTensor:
@@ -480,7 +465,7 @@ class FluxOminiTransformerBlock(FluxTransformerBlock):
                 encoder_hidden_states: torch.Tensor,
                 tembs: List[torch.Tensor],
                 position_embs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-                joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+                joint_attention_kwargs: Optional[Dict[str, Any]] = {},
                 adapters: List[str] = None,
                 **kwargs: dict,
             ):
@@ -544,7 +529,7 @@ class FluxOminiSingleTransformerBlock(FluxSingleTransformerBlock):
                 hidden_states: List[torch.Tensor],
                 tembs: List[torch.Tensor],
                 position_embs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-                joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+                joint_attention_kwargs: Optional[Dict[str, Any]] = {},
                 adapters: List[str] = None,
                 **kwargs: dict,
             ):  
@@ -622,7 +607,7 @@ class FluxOminiTransformer2DModel(FluxTransformer2DModel):
                 img_ids: List[torch.Tensor] = None, # Need to be list of take in condition inputs
                 txt_ids: torch.Tensor = None,
                 guidance: torch.Tensor = None,
-                joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+                joint_attention_kwargs: Optional[Dict[str, Any]] = {},
                 controlnet_block_samples: Optional[List[torch.Tensor]] = None,
                 controlnet_single_block_samples: Optional[List[torch.Tensor]] = None,
                 return_dict: bool = True,
@@ -716,3 +701,192 @@ class FluxOminiTransformer2DModel(FluxTransformer2DModel):
         hidden_states = self.norm_out(hidden_states_all[1], tembs[1])
         output = self.proj_out(hidden_states)
         return (output,)
+
+
+def pipeline_forward(
+    pipeline: FluxPipeline,
+    prompt: Union[str, List[str]] = None,
+    prompt_2: Optional[Union[str, List[str]]] = None,
+    height: Optional[int] = 512,
+    width: Optional[int] = 512,
+    num_inference_steps: int = 28,
+    timesteps: List[int] = None,
+    guidance_scale: float = 3.5,
+    num_images_per_prompt: Optional[int] = 1,
+    generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+    latents: Optional[torch.FloatTensor] = None,
+    prompt_embeds: Optional[torch.FloatTensor] = None,
+    pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
+    output_type: Optional[str] = "pil",
+    return_dict: bool = True,
+    joint_attention_kwargs: Optional[Dict[str, Any]] = {},
+    callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
+    callback_on_step_end_tensor_inputs: List[str] = ["latents"],
+    max_sequence_length: int = 512,
+    # Condition Parameters (Optional)
+    adapters: Optional[List[str]] = [None, None, None],
+    conditions: List[torch.Tensor] = [],
+    position_delta: torch.Tensor = None,
+    position_scale: float = 1.0,
+    image_guidance_scale: float = 1.0,
+    transformer_kwargs: Optional[Dict[str, Any]] = {},
+    kv_cache=False,
+    latent_mask=None,
+    **params: dict,
+):
+    self = pipeline
+    height = height or self.default_sample_size * self.vae_scale_factor
+    width = width or self.default_sample_size * self.vae_scale_factor
+
+    # Check inputs. Raise error if not correct
+    self.check_inputs(
+        prompt,
+        prompt_2,
+        height,
+        width,
+        prompt_embeds=prompt_embeds,
+        pooled_prompt_embeds=pooled_prompt_embeds,
+        callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,  
+        max_sequence_length=max_sequence_length,
+    )
+
+    self._guidance_scale = guidance_scale
+    self._joint_attention_kwargs = joint_attention_kwargs
+
+    # Define call parameters
+    if prompt is not None and isinstance(prompt, str):
+        batch_size = 1
+    elif prompt is not None and isinstance(prompt, list):
+        batch_size = len(prompt)
+    else:
+        batch_size = prompt_embeds.shape[0]
+
+    device = self._execution_device
+    
+    # Prepare prompt embeddings
+    (
+        prompt_embeds,
+        pooled_prompt_embeds,
+        text_ids,
+    ) = self.encode_prompt(
+        prompt=prompt,
+        prompt_2=prompt_2,
+        prompt_embeds=prompt_embeds,
+        pooled_prompt_embeds=pooled_prompt_embeds,
+        device=device,
+        num_images_per_prompt=num_images_per_prompt,
+        max_sequence_length=max_sequence_length,
+    )
+    
+    # Prepare latent variables
+    num_channels_latents = self.transformer.config.in_channels // 4
+    latents, latent_image_ids = self.prepare_latents(
+        batch_size * num_images_per_prompt,
+        num_channels_latents,
+        height,
+        width,
+        prompt_embeds.dtype,
+        device,
+        generator,
+        latents,
+    )
+    
+    # Prepare conditions
+    c_latents = pipeline.image_processor.preprocess(conditions).to(device=device, dtype=self.vae.dtype)
+    c_latents = pipeline.vae.encode(c_latents).latent_dist.sample()
+    c_latents = (c_latents - pipeline.vae.config.shift_factor) * pipeline.vae.config.scaling_factor
+    c_latents_packed = pipeline._pack_latents(c_latents, 
+                                      batch_size=c_latents.shape[0],
+                                      num_channels_latents=c_latents.shape[1],
+                                      height=c_latents.shape[2],
+                                      width=c_latents.shape[3],)
+    c_ids = FluxPipeline._prepare_latent_image_ids(
+        c_latents.shape[0],
+        c_latents.shape[2] // 2,
+        c_latents.shape[3] // 2,
+        device,
+        c_latents.dtype,
+    )
+    # Position encoding scaling and shifting 
+    if position_scale != 1.0:
+        scale_bias = (position_scale - 1.0) / 2
+        c_ids[:, 1:] *= position_scale
+        c_ids[:, 1:] += scale_bias
+    c_ids[:, 1] += position_delta[0].to(dtype=c_latents.dtype)
+    c_ids[:, 2] += position_delta[1].to(dtype=c_latents.dtype)
+    condition_latents = [c_latents_packed] # Only one condition type
+    condition_ids = [c_ids] # Only one condition type
+    
+    # Prepare timesteps
+    sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
+    image_seq_len = latents.shape[1]
+    mu = calculate_shift(
+        image_seq_len,
+        self.scheduler.config.base_image_seq_len,
+        self.scheduler.config.max_image_seq_len,
+        self.scheduler.config.base_shift,
+        self.scheduler.config.max_shift,
+    )
+    timesteps, num_inference_steps = retrieve_timesteps(
+        self.scheduler, num_inference_steps, device, timesteps, sigmas, mu=mu
+    )
+    num_warmup_steps = max(
+        len(timesteps) - num_inference_steps * self.scheduler.order, 0
+    )
+    self._num_timesteps = len(timesteps)
+    
+    branch_n = len(conditions) + 2
+    group_mask = torch.ones([branch_n, branch_n], dtype=torch.bool)
+    # Disable the attention cross different condition branches
+    group_mask[2:, 2:] = torch.diag(torch.tensor([1] * len(conditions)))
+    # Disable the attention from condition branches to image branch and text branch
+    if kv_cache:
+        group_mask[2:, :2] = False
+    
+    # Denoising loop
+    with self.progress_bar(total=num_inference_steps) as progress_bar:
+        for i, t in enumerate(timesteps):
+            # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+            timestep = t.expand(latents.shape[0]).to(latents.dtype) # / 1000
+            
+            # handle guidance
+            if self.transformer.config.guidance_embeds:
+                guidance = torch.tensor([guidance_scale], device=device)
+                guidance = guidance.expand(latents.shape[0])
+            else:
+                guidance, c_guidances = None, [None for _ in c_guidances]
+            
+            noise_pred = self.transformer(
+                hidden_states=[latents, *condition_latents],
+                encoder_hidden_states=prompt_embeds,
+                pooled_projections=pooled_prompt_embeds,
+                timesteps=[timestep, timestep] + [torch.zeros_like(timestep)] * len(condition_latents),
+                img_ids=[latent_image_ids, *condition_ids],
+                txt_ids=text_ids,
+                guidance=guidance,
+                adapters=adapters,
+                group_mask=group_mask,
+            )[0]
+            
+            # compute the previous noisy sample x_t -> x_t-1
+            latents_dtype = latents.dtype
+            latents = self.scheduler.step(noise_pred, t, latents)[0]
+            
+            # call the callback, if provided
+            if i == len(timesteps) - 1 or (
+                (i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0
+            ):
+                progress_bar.update()
+            
+    if output_type == "latent":
+        image = latents
+    else:
+        latents = self._unpack_latents(latents, height, width, self.vae_scale_factor)
+        latents = (
+            latents / self.vae.config.scaling_factor
+        ) + self.vae.config.shift_factor
+        image = self.vae.decode(latents.to(self.vae.dtype), return_dict=False)[0]
+        image = self.image_processor.postprocess(image, output_type=output_type)
+    if not return_dict:
+        return (image,)
+    return FluxPipelineOutput(images=image)

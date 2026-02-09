@@ -51,7 +51,7 @@ from peft.utils import get_peft_model_state_dict
 from diffusers.utils import convert_unet_state_dict_to_peft, _get_model_file, SAFETENSORS_WEIGHTS_NAME, WEIGHTS_NAME
 from diffusers.models.model_loading_utils import load_state_dict as load_diffusers_state_dict
 from ominilora.transformer_flux_omini import omini_transformer_forward
-from ominilora.transformer_flux_omini import FluxOminiTransformer2DModel
+from ominilora.transformer_flux_omini import FluxOminiTransformer2DModel, pipeline_forward
 
 DTYPE_MAP = {
     "bf16": torch.bfloat16,
@@ -206,7 +206,29 @@ def init_loras(adapters, transformer, lora_config):
         lambda p: p.requires_grad, transformer.parameters()
     )
     return list(lora_layers)
-    
+
+def log_validation_samples(pipeline, validation_data, adapters, accelerator, weight_dtype, config, global_step):
+    position_delta = torch.tensor([0, -config.dataset.condition_size[0] // 16])
+    generator = torch.Generator(device=accelerator.device)
+    generator.manual_seed(42)
+    for i, condition in enumerate(validation_data["pil_images"]):
+        prompt = validation_data["prompts"][i]
+        image = pipeline_forward(pipeline,
+                                 prompt=prompt,
+                                 generator=generator,
+                                 conditions=[condition],
+                                 position_delta=position_delta,
+                                 adapters=adapters)[0][0]
+        # Log to wandb
+        for tracker in accelerator.trackers:
+            if tracker.name == "wandb":
+                log_dict = {
+                    f"validation_{i}": wandb.Image(condition, caption=prompt),
+                    f"validation_{i}_image": wandb.Image(image, caption=prompt),
+                }
+                tracker.log(log_dict, step=global_step)
+        
+        
 def main():
     
     config_path = os.environ.get('CONFIG_PATH')
@@ -456,18 +478,7 @@ def main():
         desc="Steps",
         # Only show the progress bar once on each machine.
         disable=not accelerator.is_local_main_process,
-    )
-     
-    def get_sigmas(timesteps, n_dim=4, dtype=torch.float32):
-        sigmas = noise_scheduler_copy.sigmas.to(device=accelerator.device, dtype=dtype)
-        schedule_timesteps = noise_scheduler_copy.timesteps.to(accelerator.device)
-        timesteps = timesteps.to(accelerator.device)
-        step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
-
-        sigma = sigmas[step_indices].flatten()
-        while len(sigma.shape) < n_dim:
-            sigma = sigma.unsqueeze(-1)
-        return sigma
+    )   
     
     # Pre-load validation images once (avoids reloading each validation step)
     validation_data = None
@@ -569,8 +580,8 @@ def main():
                     # Position encoding scaling and shifting 
                     if position_scale != 1.0:
                         scale_bias = (position_scale - 1.0) / 2
-                        packed_condition_model_input[:, 1:] *= position_scale
-                        packed_condition_model_input[:, 1:] += scale_bias
+                        condition_latent_image_ids[:, 1:] *= position_scale
+                        condition_latent_image_ids[:, 1:] += scale_bias
                     condition_latent_image_ids[:, 1] += position_delta[0][0][0].to(dtype=condition_latent_image_ids.dtype)
                     condition_latent_image_ids[:, 2] += position_delta[0][0][1].to(dtype=condition_latent_image_ids.dtype)
                     if len(position_delta) > 1:
@@ -597,7 +608,6 @@ def main():
                 # Predict the noise residual
                 model_pred = transformer(
                     hidden_states=[packed_noisy_model_input, *condition_latents],
-                    # YiYi notes: divide it by 1000 for now because we scale it by 1000 in the transformer model (we should not keep it but I want to keep the inputs same for the model for testing)
                     timesteps=[t, t] + [torch.zeros_like(t)] * len(condition_latents),
                     guidance=guidance,
                     pooled_projections=pooled_prompt_embeds,
@@ -610,7 +620,6 @@ def main():
                     group_mask=group_mask,
                 )[0]
                 
-            
                 # Compute loss
                 target = packed_noisy_model_input - packed_model_input
                 loss = torch.mean(
@@ -658,6 +667,32 @@ def main():
                 
             if global_step >= config.train.max_train_steps:
                 break 
+            
+            if global_step % config.logging.validation_steps == 0:
+                if accelerator.is_main_process:
+                    transformer.eval()
+                    with torch.no_grad():
+                        pipeline = FluxPipeline.from_pretrained(
+                                    config.flux_path,
+                                    vae=vae,
+                                    text_encoder=text_encoder,
+                                    text_encoder_2=text_encoder_two,
+                                    transformer=unwrap_model(transformer),
+                                    torch_dtype=weight_dtype).to(accelerator.device)
+                        log_validation_samples(pipeline=pipeline,
+                                               validation_data=validation_data,
+                                               adapters=adapters,
+                                               accelerator=accelerator,
+                                               weight_dtype=weight_dtype,
+                                               config=config,
+                                               global_step=global_step,
+                                               )
+                    del pipeline
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    transformer.train()
+                            
+                    
         
                 
             
