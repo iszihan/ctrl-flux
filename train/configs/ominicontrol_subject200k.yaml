@@ -51,6 +51,14 @@ test:
   batch_size: 1
   dataloader_num_workers: 1
 
+validations:
+  images:
+  - "./dataset/test/test_in.jpg"
+  - "./dataset/test/test_out.jpg" 
+  prompts:
+  - "Resting on the picnic table at a lakeside campsite, it's caught in the golden glow of early morning, with mist rising from the water and tall pines casting long shadows behind the scene."
+  - "In a bright room. It is placed on a table."
+  
 logging:
   output_dir: "runs"
   logging_dir: "logs"
@@ -58,4 +66,4 @@ logging:
   checkpointing_steps: 1
   checkpoints_total_limit: 10
   test_steps: 200
-  validation_steps: 500
+  validation_steps: 1

@@ -38,10 +38,10 @@ accelerate launch \
     train_ip_adapter_flux.py \
     expname=ipflux-laion2b-4h100-nonzeroinit \
     resume_from_checkpoint=true \
-    resume_path=runs/ipflux-laion2b-4l40s-nonzeroinit/ip_adapter-040000 \
+    resume_path=runs/ipflux-laion2b-4l40s-nonzeroinit/ip_adapter-162000 \
     train.batch_size=8 \
     dataset.train_prefetch_factor=2 \
-    train.optimizer.lr=2e-4
+    train.optimizer.lr=3e-4
 
 # Cleanup: kill memory monitor
 kill $MONITOR_PID 2>/dev/null

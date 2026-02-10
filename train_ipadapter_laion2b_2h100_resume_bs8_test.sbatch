@@ -25,7 +25,7 @@ export CONFIG_PATH=./train/configs/ipadapter_laion2b.yaml
 # Increase learning rate from 1e-4 to 2e-4 to account for double effective batch size 
 # Dataloader num workers and prefetch factor stay the same for now.
 accelerate launch \
-    --num_processes 4 \
+    --num_processes 2 \
     --main_process_port 41353 \
     train_ip_adapter_flux.py \
     expname=ipflux-laion2b-4h100-nonzeroinit-b8-lr2e-4 \
